@@ -19,4 +19,6 @@
     <string name="bluetooth_devices_empty_description">Pair a device in Bluetooth settings, then refresh this list.</string>
     <string name="bluetooth_action_refresh">Refresh paired devices</string>
     <string name="bluetooth_action_open_settings">Bluetooth settings</string>
+    <string name="debug_action_connect">Connect</string>
+    <string name="debug_action_disconnect">Disconnect</string>
 </resources>

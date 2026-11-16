@@ -23,6 +23,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -36,6 +37,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -72,6 +74,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
+import org.hddq.bluehop.bluetooth.Api37BluetoothController
+import org.hddq.bluehop.bluetooth.BluetoothController
 import org.hddq.bluehop.bluetooth.BondedBluetoothDevice
 import org.hddq.bluehop.bluetooth.BondedDevicesState
 import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
@@ -90,8 +94,12 @@ fun MainRoute(
     val activity = LocalActivity.current
     val coroutineScope = rememberCoroutineScope()
     val repository = remember(context) { SelectedDeviceRepository.from(context) }
+    val bluetoothController: BluetoothController = remember(context) {
+        Api37BluetoothController(context.applicationContext)
+    }
 
     val selectedDevice by repository.selectedDevice.collectAsStateWithLifecycle(initialValue = null)
+    var debugControlStatus by remember { mutableStateOf<String?>(null) }
 
     var hasRequestedNearbyDevices by rememberSaveable { mutableStateOf(false) }
     var isNearbyDevicesGranted by rememberSaveable {
@@ -200,6 +208,17 @@ fun MainRoute(
             context.openBluetoothSettings()
         },
         modifier = modifier,
+        debugControlStatus = debugControlStatus,
+        onConnectClick = {
+            selectedDevice?.let { device ->
+                debugControlStatus = bluetoothController.connect(device.address).message
+            }
+        },
+        onDisconnectClick = {
+            selectedDevice?.let { device ->
+                debugControlStatus = bluetoothController.disconnect(device.address).message
+            }
+        },
     )
 }
 
@@ -214,6 +233,9 @@ fun MainScreen(
     onRefreshDevicesClick: () -> Unit,
     onOpenBluetoothSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
+    debugControlStatus: String? = null,
+    onConnectClick: () -> Unit = {},
+    onDisconnectClick: () -> Unit = {},
 ) {
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -367,6 +389,21 @@ fun MainScreen(
                                 )
                             }
                         }
+                    }
+                }
+
+                if (BuildConfig.DEBUG) {
+                    item(key = "debug_controls_spacer") {
+                        Spacer(modifier = Modifier.height(14.dp))
+                    }
+
+                    item(key = "debug_controls") {
+                        DebugBluetoothControls(
+                            enabled = selectedDevice != null,
+                            statusMessage = debugControlStatus,
+                            onConnectClick = onConnectClick,
+                            onDisconnectClick = onDisconnectClick,
+                        )
                     }
                 }
 
@@ -639,6 +676,51 @@ private fun DeviceStateListItem(
             )
         },
     )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun DebugBluetoothControls(
+    enabled: Boolean,
+    statusMessage: String?,
+    onConnectClick: () -> Unit,
+    onDisconnectClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Button(
+                onClick = onConnectClick,
+                enabled = enabled,
+                shapes = ButtonDefaults.shapes(),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(text = stringResource(R.string.debug_action_connect))
+            }
+            FilledTonalButton(
+                onClick = onDisconnectClick,
+                enabled = enabled,
+                shapes = ButtonDefaults.shapes(),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(text = stringResource(R.string.debug_action_disconnect))
+            }
+        }
+        if (statusMessage != null) {
+            Text(
+                text = statusMessage,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
+        }
+    }
 }
 
 private fun Context.hasPermission(permission: String): Boolean =
