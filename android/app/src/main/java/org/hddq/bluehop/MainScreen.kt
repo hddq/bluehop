@@ -73,11 +73,15 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import org.hddq.bluehop.bluetooth.Api37BluetoothController
+import org.hddq.bluehop.bluetooth.AudioProfileConfirmation
 import org.hddq.bluehop.bluetooth.BluetoothController
+import org.hddq.bluehop.bluetooth.BluetoothStateObserver
 import org.hddq.bluehop.bluetooth.BondedBluetoothDevice
 import org.hddq.bluehop.bluetooth.BondedDevicesState
+import org.hddq.bluehop.bluetooth.DeviceState
 import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
 import org.hddq.bluehop.bluetooth.loadBondedDevices
 import org.hddq.bluehop.data.SelectedDeviceRepository
@@ -97,8 +101,20 @@ fun MainRoute(
     val bluetoothController: BluetoothController = remember(context) {
         Api37BluetoothController(context.applicationContext)
     }
+    val stateObserver = remember(context) {
+        BluetoothStateObserver(
+            context = context.applicationContext,
+            profileConfirmation = AudioProfileConfirmation(context.applicationContext),
+        )
+    }
+    val debugConfirmationHolder = remember {
+        object {
+            var job: Job? = null
+        }
+    }
 
     val selectedDevice by repository.selectedDevice.collectAsStateWithLifecycle(initialValue = null)
+    val deviceStates by stateObserver.deviceStates.collectAsStateWithLifecycle()
     var debugControlStatus by remember { mutableStateOf<String?>(null) }
 
     var hasRequestedNearbyDevices by rememberSaveable { mutableStateOf(false) }
@@ -115,6 +131,7 @@ fun MainRoute(
         hasRequestedNearbyDevices = true
         isNearbyDevicesGranted = granted
         bondedDevicesState = loadBondedDevices(context)
+        stateObserver.refresh()
     }
 
     val associationLauncher = rememberLauncherForActivityResult(
@@ -128,7 +145,16 @@ fun MainRoute(
             hasRequestedNearbyDevices = false
         }
         bondedDevicesState = loadBondedDevices(context)
+        stateObserver.refresh()
         onPauseOrDispose {}
+    }
+
+    DisposableEffect(stateObserver) {
+        stateObserver.start()
+        onDispose {
+            debugConfirmationHolder.job?.cancel()
+            stateObserver.stop()
+        }
     }
 
     DisposableEffect(context) {
@@ -139,6 +165,7 @@ fun MainRoute(
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(receiverContext: Context?, intent: Intent?) {
                 bondedDevicesState = loadBondedDevices(context)
+                stateObserver.refresh()
             }
         }
         context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
@@ -167,6 +194,11 @@ fun MainRoute(
             status = nearbyDevicesStatus,
         ),
     )
+
+    val waitingAudioProfileText = stringResource(R.string.debug_waiting_audio_profile)
+    val audioProfileConnectedText = stringResource(R.string.debug_audio_profile_connected)
+    val audioProfileDisconnectedText = stringResource(R.string.debug_audio_profile_disconnected)
+    val audioProfileTimeoutText = stringResource(R.string.debug_audio_profile_timeout)
 
     MainScreen(
         permissions = permissions,
@@ -203,20 +235,66 @@ fun MainRoute(
         },
         onRefreshDevicesClick = {
             bondedDevicesState = loadBondedDevices(context)
+            stateObserver.refresh()
         },
         onOpenBluetoothSettingsClick = {
             context.openBluetoothSettings()
         },
         modifier = modifier,
+        deviceStates = deviceStates,
         debugControlStatus = debugControlStatus,
         onConnectClick = {
             selectedDevice?.let { device ->
-                debugControlStatus = bluetoothController.connect(device.address).message
+                debugConfirmationHolder.job?.cancel()
+                val result = bluetoothController.connect(device.address)
+                val confirmation = stateObserver.profileConfirmation
+                val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
+                    ?.devices
+                    ?.firstOrNull { it.address == device.address }
+                    ?.isAudioDevice == true
+                if (result.isSuccess && isAudioDevice && confirmation != null) {
+                    debugControlStatus = "${result.message} • $waitingAudioProfileText"
+                    debugConfirmationHolder.job = coroutineScope.launch {
+                        val confirmed = confirmation.awaitConfirmation(
+                            address = device.address,
+                            targetConnected = true,
+                        )
+                        debugControlStatus = if (confirmed) {
+                            "${result.message} • $audioProfileConnectedText"
+                        } else {
+                            "${result.message} • $audioProfileTimeoutText"
+                        }
+                    }
+                } else {
+                    debugControlStatus = result.message
+                }
             }
         },
         onDisconnectClick = {
             selectedDevice?.let { device ->
-                debugControlStatus = bluetoothController.disconnect(device.address).message
+                debugConfirmationHolder.job?.cancel()
+                val result = bluetoothController.disconnect(device.address)
+                val confirmation = stateObserver.profileConfirmation
+                val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
+                    ?.devices
+                    ?.firstOrNull { it.address == device.address }
+                    ?.isAudioDevice == true
+                if (result.isSuccess && isAudioDevice && confirmation != null) {
+                    debugControlStatus = "${result.message} • $waitingAudioProfileText"
+                    debugConfirmationHolder.job = coroutineScope.launch {
+                        val confirmed = confirmation.awaitConfirmation(
+                            address = device.address,
+                            targetConnected = false,
+                        )
+                        debugControlStatus = if (confirmed) {
+                            "${result.message} • $audioProfileDisconnectedText"
+                        } else {
+                            "${result.message} • $audioProfileTimeoutText"
+                        }
+                    }
+                } else {
+                    debugControlStatus = result.message
+                }
             }
         },
     )
@@ -233,6 +311,7 @@ fun MainScreen(
     onRefreshDevicesClick: () -> Unit,
     onOpenBluetoothSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
+    deviceStates: Map<String, DeviceState> = emptyMap(),
     debugControlStatus: String? = null,
     onConnectClick: () -> Unit = {},
     onDisconnectClick: () -> Unit = {},
@@ -381,6 +460,7 @@ fun MainScreen(
                                 val isSelected = selectedDevice?.address == device.address
                                 BondedDeviceListItem(
                                     device = device,
+                                    deviceState = deviceStates[device.address],
                                     selected = isSelected,
                                     index = index,
                                     count = bondedDevicesState.devices.size,
@@ -549,12 +629,25 @@ private fun PermissionListItem(
 @Composable
 private fun BondedDeviceListItem(
     device: BondedBluetoothDevice,
+    deviceState: DeviceState?,
     selected: Boolean,
     index: Int,
     count: Int,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val isConnected = deviceState?.isConnected == true
+    val statusLabel = when {
+        deviceState?.bredrConnected == true && deviceState.leConnected ->
+            stringResource(R.string.bluetooth_state_connected_both)
+        deviceState?.bredrConnected == true ->
+            stringResource(R.string.bluetooth_state_connected_bredr)
+        deviceState?.leConnected == true ->
+            stringResource(R.string.bluetooth_state_connected_le)
+        else ->
+            stringResource(R.string.bluetooth_state_disconnected)
+    }
+
     val iconContainerColor by animateColorAsState(
         targetValue = if (selected) {
             MaterialTheme.colorScheme.primaryContainer
@@ -599,11 +692,23 @@ private fun BondedDeviceListItem(
             }
         },
         supportingContent = {
-            Text(
-                text = device.address,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Column {
+                Text(
+                    text = statusLabel,
+                    color = if (isConnected) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = device.address,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         },
         trailingContent = {
             RadioButton(
@@ -809,6 +914,11 @@ private fun MainScreenWithDevicesPreview() {
             onDeviceClick = {},
             onRefreshDevicesClick = {},
             onOpenBluetoothSettingsClick = {},
+            deviceStates = mapOf(
+                "AA:BB:CC:DD:EE:01" to DeviceState(bredrConnected = true),
+                "AA:BB:CC:DD:EE:02" to DeviceState(),
+                "AA:BB:CC:DD:EE:03" to DeviceState(leConnected = true),
+            ),
         )
     }
 }

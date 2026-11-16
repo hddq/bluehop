@@ -19,6 +19,14 @@
     <string name="bluetooth_devices_empty_description">Pair a device in Bluetooth settings, then refresh this list.</string>
     <string name="bluetooth_action_refresh">Refresh paired devices</string>
     <string name="bluetooth_action_open_settings">Bluetooth settings</string>
+    <string name="bluetooth_state_connected_both">Connected (BR/EDR, LE)</string>
+    <string name="bluetooth_state_connected_bredr">Connected (BR/EDR)</string>
+    <string name="bluetooth_state_connected_le">Connected (LE)</string>
+    <string name="bluetooth_state_disconnected">Disconnected</string>
     <string name="debug_action_connect">Connect</string>
     <string name="debug_action_disconnect">Disconnect</string>
+    <string name="debug_waiting_audio_profile">Waiting for audio profile…</string>
+    <string name="debug_audio_profile_connected">Audio profile connected</string>
+    <string name="debug_audio_profile_disconnected">Audio profile disconnected</string>
+    <string name="debug_audio_profile_timeout">Audio profile confirmation timed out</string>
 </resources>
