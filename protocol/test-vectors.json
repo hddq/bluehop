@@ -1,0 +1,106 @@
+{
+  "protocolVersion": 1,
+  "maxSkewSeconds": 30,
+  "pskHex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+  "nowEpochSec": 1794810000,
+  "vectors": [
+    {
+      "name": "valid_grab_request",
+      "kind": "request",
+      "canonicalPayload": "v1\nrequest\n1\nAC:80:0A:CD:82:A1\nlinux-laptop\n1794809995\n4f8a9c12e0b731d4a56e8092c3f14b70",
+      "payload": {
+        "version": 1,
+        "deviceAddress": "AC:80:0A:CD:82:A1",
+        "requesterId": "linux-laptop",
+        "timestampEpochSec": 1794809995,
+        "nonce": "4f8a9c12e0b731d4a56e8092c3f14b70",
+        "signature": "dafd63f57358ebd9287a05292bf947c5a828c2dc775e24dc22ffa790c05c4bc1"
+      },
+      "expectedValid": true,
+      "expectedReason": null,
+      "replaySecondCheck": {
+        "expectedValid": false,
+        "expectedReason": "REPLAYED_NONCE"
+      }
+    },
+    {
+      "name": "invalid_signature_request",
+      "kind": "request",
+      "canonicalPayload": "v1\nrequest\n1\nAC:80:0A:CD:82:A1\nlinux-laptop\n1794809995\n99aa11223344556677889900aabbccdd",
+      "payload": {
+        "version": 1,
+        "deviceAddress": "AC:80:0A:CD:82:A1",
+        "requesterId": "linux-laptop",
+        "timestampEpochSec": 1794809995,
+        "nonce": "99aa11223344556677889900aabbccdd",
+        "signature": "0afd63f57358ebd9287a05292bf947c5a828c2dc775e24dc22ffa790c05c4bc1"
+      },
+      "expectedValid": false,
+      "expectedReason": "INVALID_SIGNATURE"
+    },
+    {
+      "name": "expired_timestamp_request",
+      "kind": "request",
+      "canonicalPayload": "v1\nrequest\n1\nAC:80:0A:CD:82:A1\nlinux-laptop\n1794809969\n7c2d4e1098a3b5c6d7e8f90123456789",
+      "payload": {
+        "version": 1,
+        "deviceAddress": "AC:80:0A:CD:82:A1",
+        "requesterId": "linux-laptop",
+        "timestampEpochSec": 1794809969,
+        "nonce": "7c2d4e1098a3b5c6d7e8f90123456789",
+        "signature": "97da8480a5cbbbcdaa4d3e49f049669e14a86d0a8a1003ad351543994330af9b"
+      },
+      "expectedValid": false,
+      "expectedReason": "TIMESTAMP_OUT_OF_WINDOW"
+    },
+    {
+      "name": "future_timestamp_request",
+      "kind": "request",
+      "canonicalPayload": "v1\nrequest\n1\nAC:80:0A:CD:82:A1\nlinux-laptop\n1794810031\n8d3e5f2109b4c6d7e8f90123456789ab",
+      "payload": {
+        "version": 1,
+        "deviceAddress": "AC:80:0A:CD:82:A1",
+        "requesterId": "linux-laptop",
+        "timestampEpochSec": 1794810031,
+        "nonce": "8d3e5f2109b4c6d7e8f90123456789ab",
+        "signature": "1b802bcadbc0240f03922bb852eab322ef6bdc012c5df3ca1f869ded52c6f014"
+      },
+      "expectedValid": false,
+      "expectedReason": "TIMESTAMP_OUT_OF_WINDOW"
+    },
+    {
+      "name": "valid_grab_response_ok",
+      "kind": "response",
+      "canonicalPayload": "v1\nresponse\n1\nok\nAC:80:0A:CD:82:A1\n1794810000\n4f8a9c12e0b731d4a56e8092c3f14b70\ndisconnected",
+      "expectedNonce": "4f8a9c12e0b731d4a56e8092c3f14b70",
+      "payload": {
+        "version": 1,
+        "status": "ok",
+        "deviceAddress": "AC:80:0A:CD:82:A1",
+        "timestampEpochSec": 1794810000,
+        "nonce": "4f8a9c12e0b731d4a56e8092c3f14b70",
+        "message": "disconnected",
+        "signature": "8efcc88544a951daa29e9019759a3f6bca74e26a0a869aa6c86b143a507b258a"
+      },
+      "expectedValid": true,
+      "expectedReason": null
+    },
+    {
+      "name": "valid_grab_response_nonce_mismatch",
+      "kind": "response",
+      "canonicalPayload": "v1\nresponse\n1\nrejected\nAC:80:0A:CD:82:A1\n1794810000\n4f8a9c12e0b731d4a56e8092c3f14b70\ndevice not connected",
+      "expectedNonce": "00000000000000000000000000000000",
+      "payload": {
+        "version": 1,
+        "status": "rejected",
+        "deviceAddress": "AC:80:0A:CD:82:A1",
+        "timestampEpochSec": 1794810000,
+        "nonce": "4f8a9c12e0b731d4a56e8092c3f14b70",
+        "message": "device not connected",
+        "signature": "e1e2787ac9305a439937d5a6d0a8ba1604363479adb293ff2a460c627e8af50b"
+      },
+      "expectedValid": false,
+      "expectedReason": "NONCE_MISMATCH"
+    }
+  ]
+}
