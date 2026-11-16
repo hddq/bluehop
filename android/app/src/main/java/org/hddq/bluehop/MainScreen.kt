@@ -1,8 +1,10 @@
 package org.hddq.bluehop
 
 import android.Manifest
+import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.companion.AssociationInfo
 import android.companion.AssociationRequest
 import android.companion.BluetoothDeviceFilter
 import android.companion.CompanionDeviceManager
@@ -56,6 +58,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,6 +87,8 @@ import org.hddq.bluehop.bluetooth.BondedDevicesState
 import org.hddq.bluehop.bluetooth.DeviceState
 import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
 import org.hddq.bluehop.bluetooth.loadBondedDevices
+import org.hddq.bluehop.bluetooth.startObservingAssociation
+import org.hddq.bluehop.bluetooth.syncObservedCompanionDevice
 import org.hddq.bluehop.data.SelectedDeviceRepository
 import org.hddq.bluehop.permissions.ManagedPermission
 import org.hddq.bluehop.permissions.PermissionGrantStatus
@@ -136,7 +141,26 @@ fun MainRoute(
 
     val associationLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult(),
-    ) { _ -> }
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val association = result.data?.getParcelableExtra(
+                CompanionDeviceManager.EXTRA_ASSOCIATION,
+                AssociationInfo::class.java,
+            )
+            if (association != null) {
+                startObservingAssociation(context, association)
+            } else {
+                selectedDevice?.address?.let { address ->
+                    syncObservedCompanionDevice(context, address)
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(selectedDevice?.address) {
+        val address = selectedDevice?.address ?: return@LaunchedEffect
+        syncObservedCompanionDevice(context, address)
+    }
 
     LifecycleResumeEffect(context) {
         val granted = context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -862,6 +886,10 @@ private fun Context.associateDevice(
         request,
         mainExecutor,
         object : CompanionDeviceManager.Callback() {
+            override fun onAssociationCreated(associationInfo: AssociationInfo) {
+                startObservingAssociation(this@associateDevice, associationInfo)
+            }
+
             override fun onAssociationPending(intentSender: IntentSender) {
                 onAssociationPending(intentSender)
             }
