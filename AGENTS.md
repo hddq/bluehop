@@ -7,3 +7,7 @@
 - The app targets Android 17+ (`minSdk = 37`); do not add backwards compatibility or version checks for older Android versions.
 - Builds must be reproducible: pin all versions (JDK 21, Gradle wrapper, AGP, Kotlin, and all dependencies); never use dynamic ranges or unpinned versions.
 - Use only Material 3 Expressive design across the UI, following the installed Compose and Material 3 skills.
+- Write the minimum working code that directly fulfills the prompt.
+- NEVER add features, banners, badges, tooltips, onboarding wizards, or extra buttons that were not explicitly requested.
+- Build only the exact UI elements described in the prompt.
+- If a task seems to require creating more than 2 new files or writing more than ~200 lines of code, STOP before editing. Briefly list the files, estimated line count, your implementation plan, and ask for confirmation first.
