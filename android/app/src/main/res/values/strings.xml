@@ -3,6 +3,8 @@
     <string name="permissions_section_title">Permissions</string>
     <string name="permission_nearby_devices_title">Nearby devices</string>
     <string name="permission_nearby_devices_description">Find and connect to nearby Bluetooth devices</string>
+    <string name="permission_local_network_title">Local network</string>
+    <string name="permission_local_network_description">Advertise this phone and receive release requests over Wi-Fi</string>
     <string name="permission_status_allowed">Allowed</string>
     <string name="permission_status_denied_permanently">Denied in system settings. Open app settings to allow.</string>
     <string name="permission_action_allow">Allow</string>

@@ -123,9 +123,14 @@ fun MainRoute(
     val deviceStates by stateObserver.deviceStates.collectAsStateWithLifecycle()
     var debugControlStatus by remember { mutableStateOf<String?>(null) }
 
+    var pendingPermissionRequest by rememberSaveable { mutableStateOf<String?>(null) }
     var hasRequestedNearbyDevices by rememberSaveable { mutableStateOf(false) }
+    var hasRequestedLocalNetwork by rememberSaveable { mutableStateOf(false) }
     var isNearbyDevicesGranted by rememberSaveable {
         mutableStateOf(context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT))
+    }
+    var isLocalNetworkGranted by rememberSaveable {
+        mutableStateOf(context.hasPermission(Manifest.permission.ACCESS_LOCAL_NETWORK))
     }
     var bondedDevicesState by remember(context) {
         mutableStateOf(loadBondedDevices(context))
@@ -133,9 +138,16 @@ fun MainRoute(
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        hasRequestedNearbyDevices = true
-        isNearbyDevicesGranted = granted
+    ) { _ ->
+        val nearbyGranted = context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        val localNetworkGranted = context.hasPermission(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        isNearbyDevicesGranted = nearbyGranted
+        isLocalNetworkGranted = localNetworkGranted
+        when (pendingPermissionRequest) {
+            Manifest.permission.BLUETOOTH_CONNECT -> hasRequestedNearbyDevices = !nearbyGranted
+            Manifest.permission.ACCESS_LOCAL_NETWORK -> hasRequestedLocalNetwork = !localNetworkGranted
+        }
+        pendingPermissionRequest = null
         bondedDevicesState = loadBondedDevices(context)
         stateObserver.refresh()
     }
@@ -164,10 +176,15 @@ fun MainRoute(
     }
 
     LifecycleResumeEffect(context) {
-        val granted = context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
-        isNearbyDevicesGranted = granted
-        if (granted) {
+        val nearbyGranted = context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        val localNetworkGranted = context.hasPermission(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        isNearbyDevicesGranted = nearbyGranted
+        isLocalNetworkGranted = localNetworkGranted
+        if (nearbyGranted) {
             hasRequestedNearbyDevices = false
+        }
+        if (localNetworkGranted) {
+            hasRequestedLocalNetwork = false
         }
         bondedDevicesState = loadBondedDevices(context)
         stateObserver.refresh()
@@ -199,14 +216,22 @@ fun MainRoute(
         }
     }
 
-    val shouldShowRationale = activity?.shouldShowRequestPermissionRationale(
+    val shouldShowNearbyRationale = activity?.shouldShowRequestPermissionRationale(
         Manifest.permission.BLUETOOTH_CONNECT,
+    ) ?: false
+    val shouldShowLocalNetworkRationale = activity?.shouldShowRequestPermissionRationale(
+        Manifest.permission.ACCESS_LOCAL_NETWORK,
     ) ?: false
 
     val nearbyDevicesStatus = resolvePermissionStatus(
         isGranted = isNearbyDevicesGranted,
-        shouldShowRationale = shouldShowRationale,
+        shouldShowRationale = shouldShowNearbyRationale,
         hasRequestedOnce = hasRequestedNearbyDevices,
+    )
+    val localNetworkStatus = resolvePermissionStatus(
+        isGranted = isLocalNetworkGranted,
+        shouldShowRationale = shouldShowLocalNetworkRationale,
+        hasRequestedOnce = hasRequestedLocalNetwork,
     )
 
     val permissions = listOf(
@@ -217,6 +242,14 @@ fun MainRoute(
             description = stringResource(R.string.permission_nearby_devices_description),
             iconRes = R.drawable.ic_bluetooth,
             status = nearbyDevicesStatus,
+        ),
+        ManagedPermission(
+            id = "local_network",
+            permission = Manifest.permission.ACCESS_LOCAL_NETWORK,
+            title = stringResource(R.string.permission_local_network_title),
+            description = stringResource(R.string.permission_local_network_description),
+            iconRes = R.drawable.ic_wifi,
+            status = localNetworkStatus,
         ),
     )
 
@@ -233,6 +266,7 @@ fun MainRoute(
             when (permission.status) {
                 PermissionGrantStatus.GRANTED -> Unit
                 PermissionGrantStatus.NOT_GRANTED -> {
+                    pendingPermissionRequest = permission.permission
                     permissionLauncher.launch(permission.permission)
                 }
                 PermissionGrantStatus.PERMANENTLY_DENIED -> {
@@ -430,7 +464,9 @@ fun MainScreen(
                                 iconRes = R.drawable.ic_bluetooth,
                                 title = stringResource(R.string.bluetooth_devices_permission_required_title),
                                 description = stringResource(R.string.bluetooth_devices_permission_required_description),
-                                actionLabel = permissions.firstOrNull()?.let { permission ->
+                                actionLabel = permissions.firstOrNull {
+                                    it.permission == Manifest.permission.BLUETOOTH_CONNECT
+                                }?.let { permission ->
                                     when (permission.status) {
                                         PermissionGrantStatus.GRANTED -> null
                                         PermissionGrantStatus.NOT_GRANTED -> stringResource(R.string.permission_action_allow)
@@ -438,7 +474,9 @@ fun MainScreen(
                                     }
                                 },
                                 onActionClick = {
-                                    permissions.firstOrNull()?.let(onPermissionActionClick)
+                                    permissions.firstOrNull {
+                                        it.permission == Manifest.permission.BLUETOOTH_CONNECT
+                                    }?.let(onPermissionActionClick)
                                 },
                             )
                         }

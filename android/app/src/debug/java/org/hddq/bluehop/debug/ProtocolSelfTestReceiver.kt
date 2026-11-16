@@ -6,7 +6,9 @@ import android.content.Intent
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import org.hddq.bluehop.data.SelectedDeviceRepository
 import org.hddq.bluehop.protocol.GrabRequest
 import org.hddq.bluehop.protocol.GrabResponse
 import org.hddq.bluehop.protocol.GrabResponseStatus
@@ -18,15 +20,27 @@ import org.hddq.bluehop.protocol.VerificationFailureReason
 import org.hddq.bluehop.protocol.VerificationResult
 
 private const val TAG = "BlueHopProtocol"
+private const val ACTION_DUMP_PSK = "org.hddq.bluehop.DEBUG_DUMP_PSK"
 
 class ProtocolSelfTestReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         val pendingResult = goAsync()
         val appContext = context.applicationContext
+        val action = intent.action
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val pskStore = KeystorePskStore.from(appContext)
+                if (action == ACTION_DUMP_PSK) {
+                    val psk = pskStore.getOrCreatePsk()
+                    val selected = SelectedDeviceRepository.from(appContext).selectedDevice.first()
+                    Log.i(
+                        TAG,
+                        "DEBUG_PSK hex=${HmacSigner.toHex(psk)} device=${selected?.address ?: "none"}",
+                    )
+                    return@launch
+                }
+
                 val psk1 = pskStore.getOrCreatePsk()
                 val psk2 = pskStore.getOrCreatePsk()
                 check(psk1.size == KeystorePskStore.PSK_BYTE_LENGTH) { "Unexpected PSK length" }

@@ -1,0 +1,269 @@
+package org.hddq.bluehop
+
+import android.bluetooth.BluetoothStatusCodes
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.runBlocking
+import org.hddq.bluehop.bluetooth.BluetoothControlResult
+import org.hddq.bluehop.bluetooth.BluetoothController
+import org.hddq.bluehop.bluetooth.DeviceState
+import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
+import org.hddq.bluehop.protocol.GrabRequest
+import org.hddq.bluehop.protocol.GrabResponseStatus
+import org.hddq.bluehop.protocol.HmacSigner
+import org.hddq.bluehop.protocol.ProtocolJson
+import org.hddq.bluehop.protocol.ProtocolVerifier
+import org.hddq.bluehop.protocol.PskStore
+import org.hddq.bluehop.protocol.VerificationFailureReason
+import org.hddq.bluehop.protocol.VerificationResult
+import org.hddq.bluehop.server.HolderHttpServer
+import org.hddq.bluehop.server.HolderStatusResponse
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
+
+class HolderHttpServerTest {
+
+    private class InMemoryPskStore(
+        private var psk: ByteArray,
+    ) : PskStore {
+        override suspend fun getOrCreatePsk(): ByteArray = psk.copyOf()
+
+        override suspend fun setPsk(psk: ByteArray) {
+            this.psk = psk.copyOf()
+        }
+
+        override suspend fun clearPsk() {
+            this.psk = ByteArray(32)
+        }
+    }
+
+    private class FakeBluetoothController(
+        private val onDisconnect: (String) -> Unit = {},
+    ) : BluetoothController {
+        val disconnectCalls = mutableListOf<String>()
+
+        override fun connect(address: String): BluetoothControlResult =
+            BluetoothControlResult(BluetoothStatusCodes.SUCCESS, "OK")
+
+        override fun disconnect(address: String): BluetoothControlResult {
+            disconnectCalls += address
+            onDisconnect(address)
+            return BluetoothControlResult(BluetoothStatusCodes.SUCCESS, "Request accepted (SUCCESS)")
+        }
+    }
+
+    private val testAddress = "AC:80:0A:CD:82:A1"
+    private val testPsk = ByteArray(32) { (it + 1).toByte() }
+    private val fixedNow = 1_760_000_000L
+
+    @Test
+    fun `status endpoint returns selected device and connection state`() = runBlocking {
+        val deviceStates = MutableStateFlow(
+            mapOf(testAddress to DeviceState(bredrConnected = true, leConnected = false)),
+        )
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", testAddress) },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = FakeBluetoothController(),
+            pskStore = InMemoryPskStore(testPsk),
+            verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow }),
+            nowEpochSeconds = { fixedNow },
+        )
+
+        val port = server.start()
+        try {
+            val client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(2))
+                .build()
+            val response = client.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/status"))
+                    .GET()
+                    .build(),
+                HttpResponse.BodyHandlers.ofString(),
+            )
+            assertEquals(200, response.statusCode())
+            val status = ProtocolJson.codec.decodeFromString<HolderStatusResponse>(response.body())
+            assertEquals(testAddress, status.deviceAddress)
+            assertEquals("WH-1000XM4", status.deviceName)
+            assertTrue(status.connected)
+            assertTrue(status.bredrConnected)
+            assertFalse(status.leConnected)
+            assertEquals(port, status.port)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `release rejects invalid signature without calling disconnect`() = runBlocking {
+        val deviceStates = MutableStateFlow(
+            mapOf(testAddress to DeviceState(bredrConnected = true)),
+        )
+        val controller = FakeBluetoothController()
+        val verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow })
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", testAddress) },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = controller,
+            pskStore = InMemoryPskStore(testPsk),
+            verifier = verifier,
+            nowEpochSeconds = { fixedNow },
+        )
+
+        val port = server.start()
+        try {
+            val badRequest = GrabRequest(
+                deviceAddress = testAddress,
+                requesterId = "pc-linux",
+                timestampEpochSec = fixedNow,
+                nonce = "00112233445566778899aabbccddeeff",
+                signature = "0".repeat(64),
+            )
+            val response = postRelease(port, ProtocolJson.encodeRequest(badRequest))
+            assertEquals(401, response.statusCode())
+            assertTrue(controller.disconnectCalls.isEmpty())
+
+            val grabResponse = ProtocolJson.decodeResponse(response.body())
+            assertEquals(GrabResponseStatus.REJECTED, grabResponse.status)
+            assertEquals(VerificationFailureReason.INVALID_SIGNATURE.name, grabResponse.message)
+            assertEquals(VerificationResult.Valid, verifier.verifyResponse(grabResponse, testPsk, badRequest.nonce))
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `release waits for disconnect confirmation before responding and blocks replay`() = runBlocking {
+        val deviceStates = MutableStateFlow(
+            mapOf(testAddress to DeviceState(bredrConnected = true)),
+        )
+        val disconnectCalled = CompletableDeferred<Unit>()
+        val controller = FakeBluetoothController(
+            onDisconnect = { disconnectCalled.complete(Unit) },
+        )
+        val verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow })
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", testAddress) },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = controller,
+            pskStore = InMemoryPskStore(testPsk),
+            verifier = verifier,
+            nowEpochSeconds = { fixedNow },
+            disconnectRetryDelayMs = 2_000L,
+            disconnectTimeoutMs = 5_000L,
+            pollIntervalMs = 50L,
+        )
+
+        val port = server.start()
+        try {
+            val signedRequest = HmacSigner.signRequest(
+                psk = testPsk,
+                request = GrabRequest(
+                    deviceAddress = testAddress.lowercase(),
+                    requesterId = "pc-linux",
+                    timestampEpochSec = fixedNow,
+                    nonce = "abcdef0123456789abcdef0123456789",
+                ),
+            )
+            val bodyJson = ProtocolJson.encodeRequest(signedRequest)
+
+            val responseDeferred = async(Dispatchers.IO) {
+                postRelease(port, bodyJson)
+            }
+
+            disconnectCalled.await()
+            delay(150L)
+            assertFalse("Server must wait for disconnect confirmation before answering", responseDeferred.isCompleted)
+
+            deviceStates.value = mapOf(testAddress to DeviceState(bredrConnected = false, leConnected = false))
+
+            val response = responseDeferred.await()
+            assertEquals(200, response.statusCode())
+            assertEquals(listOf(testAddress), controller.disconnectCalls)
+
+            val grabResponse = ProtocolJson.decodeResponse(response.body())
+            assertEquals(GrabResponseStatus.OK, grabResponse.status)
+            assertEquals(
+                VerificationResult.Valid,
+                verifier.verifyResponse(grabResponse, testPsk, signedRequest.nonce),
+            )
+
+            // Replaying the same signed request must be rejected with 401 REPLAYED_NONCE
+            val replayResponse = postRelease(port, bodyJson)
+            assertEquals(401, replayResponse.statusCode())
+            val replayGrabResponse = ProtocolJson.decodeResponse(replayResponse.body())
+            assertEquals(VerificationFailureReason.REPLAYED_NONCE.name, replayGrabResponse.message)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun `release returns conflict when device is already disconnected`() = runBlocking {
+        val deviceStates = MutableStateFlow(
+            mapOf(testAddress to DeviceState(bredrConnected = false, leConnected = false)),
+        )
+        val controller = FakeBluetoothController()
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", testAddress) },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = controller,
+            pskStore = InMemoryPskStore(testPsk),
+            verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow }),
+            nowEpochSeconds = { fixedNow },
+        )
+
+        val port = server.start()
+        try {
+            val signedRequest = HmacSigner.signRequest(
+                psk = testPsk,
+                request = GrabRequest(
+                    deviceAddress = testAddress,
+                    requesterId = "pc-linux",
+                    timestampEpochSec = fixedNow,
+                    nonce = "11223344556677889900aabbccddeeff",
+                ),
+            )
+            val response = postRelease(port, ProtocolJson.encodeRequest(signedRequest))
+            assertEquals(409, response.statusCode())
+            assertTrue(controller.disconnectCalls.isEmpty())
+            val grabResponse = ProtocolJson.decodeResponse(response.body())
+            assertEquals(GrabResponseStatus.REJECTED, grabResponse.status)
+        } finally {
+            server.stop()
+        }
+    }
+
+    private fun postRelease(port: Int, jsonBody: String): HttpResponse<String> {
+        val client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(2))
+            .build()
+        val request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/release"))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+            .build()
+        return client.send(request, HttpResponse.BodyHandlers.ofString())
+    }
+}

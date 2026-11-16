@@ -9,6 +9,7 @@
             tools:ignore="ExportedReceiver">
             <intent-filter>
                 <action android:name="org.hddq.bluehop.DEBUG_PROTOCOL_SELF_TEST" />
+                <action android:name="org.hddq.bluehop.DEBUG_DUMP_PSK" />
             </intent-filter>
         </receiver>
     </application>
