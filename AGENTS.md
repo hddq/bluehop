@@ -6,3 +6,4 @@
 - Keep this file under 40 lines total; never add style rules, repo summaries, or task-specific trivia.
 - The app targets Android 17+ (`minSdk = 37`); do not add backwards compatibility or version checks for older Android versions.
 - Builds must be reproducible: pin all versions (JDK 21, Gradle wrapper, AGP, Kotlin, and all dependencies); never use dynamic ranges or unpinned versions.
+- Use only Material 3 Expressive design across the UI, following the installed Compose and Material 3 skills.
