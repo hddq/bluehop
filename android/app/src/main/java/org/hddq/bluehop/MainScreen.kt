@@ -3,16 +3,21 @@ package org.hddq.bluehop
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.companion.AssociationRequest
+import android.companion.BluetoothDeviceFilter
+import android.companion.CompanionDeviceManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
 import android.provider.Settings
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
@@ -104,6 +109,10 @@ fun MainRoute(
         bondedDevicesState = loadBondedDevices(context)
     }
 
+    val associationLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult(),
+    ) { _ -> }
+
     LifecycleResumeEffect(context) {
         val granted = context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
         isNearbyDevicesGranted = granted
@@ -175,6 +184,14 @@ fun MainRoute(
                     ),
                 )
             }
+            context.associateDevice(
+                address = device.address,
+                onAssociationPending = { intentSender ->
+                    associationLauncher.launch(
+                        IntentSenderRequest.Builder(intentSender).build(),
+                    )
+                },
+            )
         },
         onRefreshDevicesClick = {
             bondedDevicesState = loadBondedDevices(context)
@@ -639,6 +656,32 @@ private fun Context.openBluetoothSettings() {
     val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     startActivity(intent)
+}
+
+private fun Context.associateDevice(
+    address: String,
+    onAssociationPending: (IntentSender) -> Unit,
+) {
+    val companionDeviceManager = getSystemService(CompanionDeviceManager::class.java) ?: return
+    val deviceFilter = BluetoothDeviceFilter.Builder()
+        .setAddress(address)
+        .build()
+    val request = AssociationRequest.Builder()
+        .addDeviceFilter(deviceFilter)
+        .setSingleDevice(true)
+        .build()
+
+    companionDeviceManager.associate(
+        request,
+        mainExecutor,
+        object : CompanionDeviceManager.Callback() {
+            override fun onAssociationPending(intentSender: IntentSender) {
+                onAssociationPending(intentSender)
+            }
+
+            override fun onFailure(error: CharSequence?) = Unit
+        },
+    )
 }
 
 @Preview(showBackground = true)
