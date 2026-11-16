@@ -1,0 +1,12 @@
+.direnv/
+result
+result-*
+local.properties
+.gradle/
+build/
+.idea/
+*.iml
+*.apk
+*.aab
+*.keystore
+*.jks
