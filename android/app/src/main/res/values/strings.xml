@@ -1,3 +1,11 @@
 <resources>
     <string name="app_name">BlueHop</string>
+    <string name="main_subtitle">Permissions</string>
+    <string name="permissions_section_title">Permissions</string>
+    <string name="permission_nearby_devices_title">Nearby devices</string>
+    <string name="permission_nearby_devices_description">Find and connect to nearby Bluetooth devices</string>
+    <string name="permission_status_allowed">Allowed</string>
+    <string name="permission_status_denied_permanently">Denied in system settings. Open app settings to allow.</string>
+    <string name="permission_action_allow">Allow</string>
+    <string name="permission_action_open_settings">Settings</string>
 </resources>
