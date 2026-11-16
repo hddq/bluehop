@@ -39,6 +39,38 @@ class BlueHopCompanionService : CompanionDeviceService() {
     }
 }
 
+internal data class AssociationEntry(
+    val id: Int,
+    val address: String?,
+)
+
+internal data class AssociationSyncPlan(
+    val keepAssociationId: Int?,
+    val stopObservingIds: List<Int>,
+    val disassociateIds: List<Int>,
+)
+
+internal fun buildAssociationSyncPlan(
+    associations: List<AssociationEntry>,
+    targetAddress: String,
+): AssociationSyncPlan {
+    val matching = associations.filter { entry ->
+        entry.address?.equals(targetAddress, ignoreCase = true) == true
+    }
+    val keep = matching.firstOrNull()
+    val stopIds = associations
+        .filter { it.id != keep?.id }
+        .map { it.id }
+    val duplicateIds = matching
+        .drop(1)
+        .map { it.id }
+    return AssociationSyncPlan(
+        keepAssociationId = keep?.id,
+        stopObservingIds = stopIds,
+        disassociateIds = duplicateIds,
+    )
+}
+
 internal fun formatPresenceEvent(eventType: Int, associationId: Int): String {
     val label = when (eventType) {
         DevicePresenceEvent.EVENT_BT_CONNECTED -> "BT connected"
@@ -73,23 +105,34 @@ fun syncObservedCompanionDevice(
         ?: return
 
     val associations = companionDeviceManager.myAssociations
-    val targetAssociation = findAssociationForAddress(associations, targetAddress)
+    val plan = buildAssociationSyncPlan(
+        associations = associations.map { AssociationEntry(it.id, it.deviceMacAddress?.toString()) },
+        targetAddress = targetAddress,
+    )
 
-    for (association in associations) {
-        if (targetAssociation == null || association.id != targetAssociation.id) {
-            runCatching {
-                val stopRequest = ObservingDevicePresenceRequest.Builder()
-                    .setAssociationId(association.id)
-                    .build()
-                companionDeviceManager.stopObservingDevicePresence(stopRequest)
-            }.onFailure { error ->
-                Log.w(TAG, "Failed to stop observing associationId=${association.id}", error)
-            }
+    for (associationId in plan.stopObservingIds) {
+        runCatching {
+            val stopRequest = ObservingDevicePresenceRequest.Builder()
+                .setAssociationId(associationId)
+                .build()
+            companionDeviceManager.stopObservingDevicePresence(stopRequest)
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to stop observing associationId=$associationId", error)
         }
     }
 
-    if (targetAssociation != null) {
-        startObservingAssociation(companionDeviceManager, targetAssociation)
+    for (duplicateId in plan.disassociateIds) {
+        runCatching {
+            companionDeviceManager.disassociate(duplicateId)
+            Log.i(TAG, "Removed duplicate associationId=$duplicateId for $targetAddress")
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to disassociate duplicate associationId=$duplicateId", error)
+        }
+    }
+
+    val keepAssociation = associations.firstOrNull { it.id == plan.keepAssociationId }
+    if (keepAssociation != null) {
+        startObservingAssociation(companionDeviceManager, keepAssociation)
     }
 }
 

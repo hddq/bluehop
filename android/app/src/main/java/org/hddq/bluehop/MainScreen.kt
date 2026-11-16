@@ -87,6 +87,7 @@ import org.hddq.bluehop.bluetooth.BondedDevicesState
 import org.hddq.bluehop.bluetooth.DeviceState
 import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
 import org.hddq.bluehop.bluetooth.loadBondedDevices
+import org.hddq.bluehop.bluetooth.findAssociationForAddress
 import org.hddq.bluehop.bluetooth.startObservingAssociation
 import org.hddq.bluehop.bluetooth.syncObservedCompanionDevice
 import org.hddq.bluehop.data.SelectedDeviceRepository
@@ -873,7 +874,15 @@ private fun Context.associateDevice(
     address: String,
     onAssociationPending: (IntentSender) -> Unit,
 ) {
+    if (!packageManager.hasSystemFeature(PackageManager.FEATURE_COMPANION_DEVICE_SETUP)) {
+        return
+    }
     val companionDeviceManager = getSystemService(CompanionDeviceManager::class.java) ?: return
+    if (findAssociationForAddress(companionDeviceManager.myAssociations, address) != null) {
+        syncObservedCompanionDevice(this, address)
+        return
+    }
+
     val deviceFilter = BluetoothDeviceFilter.Builder()
         .setAddress(address)
         .build()
