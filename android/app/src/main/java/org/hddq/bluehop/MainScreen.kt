@@ -214,13 +214,6 @@ fun MainScreen(
                         overflow = TextOverflow.Ellipsis,
                     )
                 },
-                subtitle = {
-                    Text(
-                        text = stringResource(R.string.main_subtitle),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
                     scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -258,20 +251,6 @@ fun MainScreen(
                         count = permissions.size,
                         onActionClick = { onPermissionActionClick(item) },
                     )
-                }
-
-                item(key = "selected_device_spacer") {
-                    Spacer(modifier = Modifier.height(14.dp))
-                }
-
-                item(key = "selected_device_header") {
-                    SectionHeader(
-                        title = stringResource(R.string.selected_device_section_title),
-                    )
-                }
-
-                item(key = "selected_device_card") {
-                    SelectedDeviceSummaryItem(selectedDevice = selectedDevice)
                 }
 
                 item(key = "paired_devices_spacer") {
@@ -348,7 +327,7 @@ fun MainScreen(
                         if (bondedDevicesState.devices.isEmpty()) {
                             item(key = "devices_empty") {
                                 DeviceStateListItem(
-                                    iconRes = R.drawable.ic_headphones,
+                                    iconRes = R.drawable.ic_bluetooth,
                                     title = stringResource(R.string.bluetooth_devices_empty_title),
                                     description = stringResource(R.string.bluetooth_devices_empty_description),
                                     actionLabel = stringResource(R.string.bluetooth_action_open_settings),
@@ -507,72 +486,6 @@ private fun PermissionListItem(
             Text(
                 text = item.title,
                 style = MaterialTheme.typography.titleMedium,
-            )
-        },
-    )
-}
-
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
-@Composable
-private fun SelectedDeviceSummaryItem(
-    selectedDevice: SelectedBluetoothDevice?,
-    modifier: Modifier = Modifier,
-) {
-    val hasSelection = selectedDevice != null
-    val iconContainerColor by animateColorAsState(
-        targetValue = if (hasSelection) {
-            MaterialTheme.colorScheme.primaryContainer
-        } else {
-            MaterialTheme.colorScheme.surfaceContainerHigh
-        },
-        label = "selectedDeviceIconContainer",
-    )
-    val iconContentColor by animateColorAsState(
-        targetValue = if (hasSelection) {
-            MaterialTheme.colorScheme.onPrimaryContainer
-        } else {
-            MaterialTheme.colorScheme.onSurfaceVariant
-        },
-        label = "selectedDeviceIconContent",
-    )
-
-    SegmentedListItem(
-        shapes = ListItemDefaults.segmentedShapes(index = 0, count = 1),
-        colors = ListItemDefaults.colors(
-            containerColor = MaterialTheme.colorScheme.surfaceBright,
-        ),
-        modifier = modifier,
-        leadingContent = {
-            Surface(
-                shape = CircleShape,
-                color = iconContainerColor,
-                contentColor = iconContentColor,
-                modifier = Modifier.size(40.dp),
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        painter = painterResource(
-                            if (hasSelection) R.drawable.ic_headphones else R.drawable.ic_bluetooth,
-                        ),
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                    )
-                }
-            }
-        },
-        supportingContent = {
-            Text(
-                text = selectedDevice?.address ?: stringResource(R.string.selected_device_none_description),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        },
-        content = {
-            Text(
-                text = selectedDevice?.name ?: stringResource(R.string.selected_device_none_title),
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
         },
     )
