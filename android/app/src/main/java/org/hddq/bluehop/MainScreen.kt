@@ -85,17 +85,23 @@ import org.hddq.bluehop.bluetooth.BluetoothStateObserver
 import org.hddq.bluehop.bluetooth.BondedBluetoothDevice
 import org.hddq.bluehop.bluetooth.BondedDevicesState
 import org.hddq.bluehop.bluetooth.DeviceState
+import org.hddq.bluehop.bluetooth.HopCoordinator
+import org.hddq.bluehop.bluetooth.HopOutcome
+import org.hddq.bluehop.bluetooth.HopProgress
 import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
-import org.hddq.bluehop.bluetooth.loadBondedDevices
 import org.hddq.bluehop.bluetooth.findAssociationForAddress
+import org.hddq.bluehop.bluetooth.loadBondedDevices
 import org.hddq.bluehop.bluetooth.startObservingAssociation
 import org.hddq.bluehop.bluetooth.syncObservedCompanionDevice
 import org.hddq.bluehop.data.SelectedDeviceRepository
 import org.hddq.bluehop.permissions.ManagedPermission
 import org.hddq.bluehop.permissions.PermissionGrantStatus
 import org.hddq.bluehop.permissions.resolvePermissionStatus
+import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PairedPeerSummary
 import org.hddq.bluehop.protocol.PairedPeersRepository
+import org.hddq.bluehop.server.GrabClient
+import org.hddq.bluehop.server.NsdPeerDiscovery
 import org.hddq.bluehop.ui.theme.BlueHopTheme
 
 @Composable
@@ -116,16 +122,29 @@ fun MainRoute(
             profileConfirmation = AudioProfileConfirmation(context.applicationContext),
         )
     }
-    val debugConfirmationHolder = remember {
+    val peerDiscovery = remember(context) { NsdPeerDiscovery(context) }
+    val grabClient = remember { GrabClient() }
+    val hopCoordinator = remember(bluetoothController, grabClient, stateObserver) {
+        HopCoordinator(
+            bluetoothController = bluetoothController,
+            holderClient = grabClient,
+            profileConfirmation = stateObserver.profileConfirmation,
+        )
+    }
+    val jobHolder = remember {
         object {
-            var job: Job? = null
+            var debugJob: Job? = null
+            var hopJob: Job? = null
         }
     }
 
     val selectedDevice by repository.selectedDevice.collectAsStateWithLifecycle(initialValue = null)
     val pairedPeers by pairedPeersRepository.peerSummaries.collectAsStateWithLifecycle(initialValue = emptyList())
     val deviceStates by stateObserver.deviceStates.collectAsStateWithLifecycle()
+    var localIdentity by remember { mutableStateOf<LocalDeviceIdentity?>(null) }
+    var isScreenResumed by remember { mutableStateOf(false) }
     var debugControlStatus by remember { mutableStateOf<String?>(null) }
+    var hopStatus by remember { mutableStateOf<HopUiStatus?>(null) }
     var showPairingDialog by rememberSaveable { mutableStateOf(false) }
 
     var pendingPermissionRequest by rememberSaveable { mutableStateOf<String?>(null) }
@@ -175,12 +194,20 @@ fun MainRoute(
         }
     }
 
+    LaunchedEffect(pairedPeersRepository) {
+        localIdentity = pairedPeersRepository.getOrCreateIdentity()
+    }
+
     LaunchedEffect(selectedDevice?.address) {
+        if (hopStatus !is HopUiStatus.InProgress) {
+            hopStatus = null
+        }
         val address = selectedDevice?.address ?: return@LaunchedEffect
         syncObservedCompanionDevice(context, address)
     }
 
     LifecycleResumeEffect(context) {
+        isScreenResumed = true
         val nearbyGranted = context.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
         val localNetworkGranted = context.hasPermission(Manifest.permission.ACCESS_LOCAL_NETWORK)
         isNearbyDevicesGranted = nearbyGranted
@@ -193,13 +220,30 @@ fun MainRoute(
         }
         bondedDevicesState = loadBondedDevices(context)
         stateObserver.refresh()
-        onPauseOrDispose {}
+        onPauseOrDispose {
+            isScreenResumed = false
+        }
     }
 
-    DisposableEffect(stateObserver) {
+    DisposableEffect(peerDiscovery, isScreenResumed, isLocalNetworkGranted, showPairingDialog, localIdentity?.deviceId) {
+        val myId = localIdentity?.deviceId
+        if (isScreenResumed && isLocalNetworkGranted && !showPairingDialog && myId != null) {
+            peerDiscovery.start(
+                excludeDeviceId = myId,
+                pairingOnly = false,
+            )
+        }
+        onDispose {
+            peerDiscovery.stop()
+        }
+    }
+
+    DisposableEffect(stateObserver, peerDiscovery) {
         stateObserver.start()
         onDispose {
-            debugConfirmationHolder.job?.cancel()
+            jobHolder.debugJob?.cancel()
+            jobHolder.hopJob?.cancel()
+            peerDiscovery.shutdown()
             stateObserver.stop()
         }
     }
@@ -263,6 +307,12 @@ fun MainRoute(
     val audioProfileDisconnectedText = stringResource(R.string.debug_audio_profile_disconnected)
     val audioProfileTimeoutText = stringResource(R.string.debug_audio_profile_timeout)
 
+    val selectedAddress = selectedDevice?.address
+    val isSelectedConnected = selectedAddress != null && deviceStates.entries
+        .firstOrNull { (key, _) -> key.equals(selectedAddress, ignoreCase = true) }
+        ?.value
+        ?.isConnected == true
+
     MainScreen(
         permissions = permissions,
         selectedDevice = selectedDevice,
@@ -306,10 +356,68 @@ fun MainRoute(
         },
         modifier = modifier,
         deviceStates = deviceStates,
+        isSelectedConnected = isSelectedConnected,
+        hopStatus = hopStatus,
+        onHopConnectClick = {
+            val device = selectedDevice
+            if (device != null && hopStatus !is HopUiStatus.InProgress) {
+                val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
+                    ?.devices
+                    ?.firstOrNull { it.address.equals(device.address, ignoreCase = true) }
+                    ?.isAudioDevice == true
+                jobHolder.hopJob?.cancel()
+                hopStatus = HopUiStatus.InProgress(HopProgress.Searching)
+                jobHolder.hopJob = coroutineScope.launch {
+                    try {
+                        val identity = localIdentity ?: pairedPeersRepository.getOrCreateIdentity().also {
+                            localIdentity = it
+                        }
+                        val outcome = hopCoordinator.hopToDevice(
+                            targetAddress = device.address,
+                            targetName = device.name,
+                            isAudioDevice = isAudioDevice,
+                            isLocallyConnected = isSelectedConnected,
+                            localIdentity = identity,
+                            peersFlow = peerDiscovery.peers,
+                            hasPairedPeers = pairedPeers.isNotEmpty() && isLocalNetworkGranted,
+                            peerPskProvider = { peerId -> pairedPeersRepository.getPeerPsk(peerId) },
+                            onProgress = { progress ->
+                                hopStatus = HopUiStatus.InProgress(progress)
+                            },
+                        )
+                        hopStatus = HopUiStatus.Finished(outcome)
+                        when (outcome) {
+                            is HopOutcome.Connected,
+                            is HopOutcome.ConnectedUnconfirmed,
+                            -> stateObserver.refresh()
+
+                            HopOutcome.NeedsAssociation -> {
+                                context.associateDevice(
+                                    address = device.address,
+                                    onAssociationPending = { intentSender ->
+                                        associationLauncher.launch(
+                                            IntentSenderRequest.Builder(intentSender).build(),
+                                        )
+                                    },
+                                )
+                            }
+
+                            HopOutcome.AlreadyConnected,
+                            is HopOutcome.Failed,
+                            -> Unit
+                        }
+                    } finally {
+                        if (hopStatus is HopUiStatus.InProgress) {
+                            hopStatus = null
+                        }
+                    }
+                }
+            }
+        },
         debugControlStatus = debugControlStatus,
         onConnectClick = {
             selectedDevice?.let { device ->
-                debugConfirmationHolder.job?.cancel()
+                jobHolder.debugJob?.cancel()
                 val result = bluetoothController.connect(device.address)
                 val confirmation = stateObserver.profileConfirmation
                 val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
@@ -318,7 +426,7 @@ fun MainRoute(
                     ?.isAudioDevice == true
                 if (result.isSuccess && isAudioDevice && confirmation != null) {
                     debugControlStatus = "${result.message} • $waitingAudioProfileText"
-                    debugConfirmationHolder.job = coroutineScope.launch {
+                    jobHolder.debugJob = coroutineScope.launch {
                         val confirmed = confirmation.awaitConfirmation(
                             address = device.address,
                             targetConnected = true,
@@ -336,7 +444,7 @@ fun MainRoute(
         },
         onDisconnectClick = {
             selectedDevice?.let { device ->
-                debugConfirmationHolder.job?.cancel()
+                jobHolder.debugJob?.cancel()
                 val result = bluetoothController.disconnect(device.address)
                 val confirmation = stateObserver.profileConfirmation
                 val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
@@ -345,7 +453,7 @@ fun MainRoute(
                     ?.isAudioDevice == true
                 if (result.isSuccess && isAudioDevice && confirmation != null) {
                     debugControlStatus = "${result.message} • $waitingAudioProfileText"
-                    debugConfirmationHolder.job = coroutineScope.launch {
+                    jobHolder.debugJob = coroutineScope.launch {
                         val confirmed = confirmation.awaitConfirmation(
                             address = device.address,
                             targetConnected = false,
@@ -397,6 +505,12 @@ fun MainRoute(
     }
 }
 
+sealed interface HopUiStatus {
+    data class InProgress(val progress: HopProgress) : HopUiStatus
+
+    data class Finished(val outcome: HopOutcome) : HopUiStatus
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun MainScreen(
@@ -409,6 +523,9 @@ fun MainScreen(
     onOpenBluetoothSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
     deviceStates: Map<String, DeviceState> = emptyMap(),
+    isSelectedConnected: Boolean = false,
+    hopStatus: HopUiStatus? = null,
+    onHopConnectClick: () -> Unit = {},
     debugControlStatus: String? = null,
     onConnectClick: () -> Unit = {},
     onDisconnectClick: () -> Unit = {},
@@ -572,6 +689,17 @@ fun MainScreen(
                                     onClick = { onDeviceClick(device) },
                                     modifier = Modifier.animateItem(),
                                 )
+                            }
+
+                            if (selectedDevice != null) {
+                                item(key = "hop_controls") {
+                                    HopActionControls(
+                                        isConnected = isSelectedConnected,
+                                        hopStatus = hopStatus,
+                                        onConnectClick = onHopConnectClick,
+                                        modifier = Modifier.padding(top = 8.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -1011,6 +1139,73 @@ private fun PairedHostListItem(
             )
         },
     )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun HopActionControls(
+    isConnected: Boolean,
+    hopStatus: HopUiStatus?,
+    onConnectClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val isHopInProgress = hopStatus is HopUiStatus.InProgress
+    val buttonLabel = when {
+        isHopInProgress -> stringResource(R.string.hop_action_hopping)
+        isConnected -> stringResource(R.string.hop_action_connected)
+        else -> stringResource(R.string.hop_action_connect)
+    }
+    val statusMessage = when (hopStatus) {
+        null -> null
+        is HopUiStatus.InProgress -> when (val progress = hopStatus.progress) {
+            HopProgress.Searching -> stringResource(R.string.hop_status_searching)
+            is HopProgress.Releasing -> stringResource(R.string.hop_status_releasing, progress.holderName)
+            is HopProgress.Connecting -> stringResource(R.string.hop_status_connecting, progress.deviceName)
+            is HopProgress.ConfirmingAudio ->
+                stringResource(R.string.hop_status_confirming_audio, progress.deviceName)
+        }
+        is HopUiStatus.Finished -> when (val outcome = hopStatus.outcome) {
+            HopOutcome.AlreadyConnected -> stringResource(R.string.hop_status_already_connected)
+            is HopOutcome.Connected -> if (outcome.releasedFromHolderName != null) {
+                stringResource(R.string.hop_status_connected_from, outcome.releasedFromHolderName)
+            } else {
+                stringResource(R.string.hop_status_connected)
+            }
+            is HopOutcome.ConnectedUnconfirmed ->
+                stringResource(R.string.hop_status_connected_unconfirmed)
+            HopOutcome.NeedsAssociation ->
+                stringResource(R.string.hop_status_needs_association)
+            is HopOutcome.Failed -> outcome.message
+        }
+    }
+    val statusIsError = hopStatus is HopUiStatus.Finished &&
+        (hopStatus.outcome is HopOutcome.Failed || hopStatus.outcome is HopOutcome.NeedsAssociation)
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Button(
+            onClick = onConnectClick,
+            enabled = !isHopInProgress && !isConnected,
+            shapes = ButtonDefaults.shapes(),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(text = buttonLabel)
+        }
+        if (statusMessage != null) {
+            Text(
+                text = statusMessage,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (statusIsError) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
