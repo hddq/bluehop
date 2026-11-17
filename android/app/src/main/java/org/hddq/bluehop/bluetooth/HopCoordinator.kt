@@ -129,7 +129,9 @@ class HopCoordinator(
         if (candidates.isEmpty()) return HolderReleaseAttempt.NoActiveHolder
 
         val directMatches = candidates.filter { candidate ->
-            candidate.peer.connectedBluetoothAddress?.equals(targetAddress, ignoreCase = true) == true
+            candidate.peer.connectedBluetoothAddresses.any {
+                it.equals(targetAddress, ignoreCase = true)
+            }
         }
         for (candidate in directMatches) {
             when (val result = tryRelease(candidate, targetAddress, localDeviceId, onProgress)) {
@@ -140,13 +142,14 @@ class HopCoordinator(
         }
 
         val fallbackCandidates = candidates.filter { candidate ->
-            candidate.peer.connectedBluetoothAddress == null
+            candidate.peer.connectedBluetoothAddresses.isEmpty()
         }
         for (candidate in fallbackCandidates) {
             val status = holderClient.fetchStatus(candidate.peer.host, candidate.peer.port).getOrNull()
                 ?: continue
-            val holdsTarget = status.connected &&
-                status.deviceAddress?.equals(targetAddress, ignoreCase = true) == true
+            val holdsTarget = status.devices.any {
+                it.connected && it.deviceAddress.equals(targetAddress, ignoreCase = true)
+            } || (status.connected && status.deviceAddress?.equals(targetAddress, ignoreCase = true) == true)
             if (!holdsTarget) continue
 
             val displayCandidate = candidate.copy(

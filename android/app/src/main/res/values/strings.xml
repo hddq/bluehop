@@ -58,9 +58,8 @@
     <string name="pairing_status_pairing">Exchanging keys…</string>
     <string name="pairing_status_success">Paired with %1$s</string>
 
+    <string name="bluetooth_switch_content_description">Manage %1$s with BlueHop</string>
     <string name="hop_action_connect">Connect</string>
-    <string name="hop_action_connected">Connected</string>
-    <string name="hop_action_hopping">Connecting…</string>
     <string name="hop_status_searching">Checking paired devices on Wi-Fi…</string>
     <string name="hop_status_releasing">Releasing from %1$s…</string>
     <string name="hop_status_connecting">Connecting to %1$s…</string>

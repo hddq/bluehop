@@ -357,6 +357,91 @@ class HolderHttpServerTest {
         }
     }
 
+    @Test
+    fun `status lists multiple managed devices and release targets matched managed device`() = runBlocking {
+        val secondAddress = "11:22:33:44:55:66"
+        val unmanagedAddress = "99:88:77:66:55:44"
+        val deviceStates = MutableStateFlow(
+            mapOf(
+                testAddress to DeviceState(bredrConnected = false, leConnected = false),
+                secondAddress to DeviceState(bredrConnected = true, leConnected = false),
+                unmanagedAddress to DeviceState(bredrConnected = true, leConnected = false),
+            ),
+        )
+        val controller = FakeBluetoothController(
+            onDisconnect = { addr ->
+                deviceStates.value = deviceStates.value + (addr to DeviceState())
+            },
+        )
+        val verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow })
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            managedDevicesProvider = {
+                listOf(
+                    SelectedBluetoothDevice("WH-1000XM4", testAddress),
+                    SelectedBluetoothDevice("Pixel Buds Pro 2", secondAddress),
+                )
+            },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = controller,
+            pskStore = InMemoryPskStore(testPsk),
+            verifier = verifier,
+            nowEpochSeconds = { fixedNow },
+        )
+
+        val port = server.start()
+        try {
+            val client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(2))
+                .build()
+            val statusHttp = client.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/status"))
+                    .GET()
+                    .build(),
+                HttpResponse.BodyHandlers.ofString(),
+            )
+            assertEquals(200, statusHttp.statusCode())
+            val status = ProtocolJson.codec.decodeFromString<HolderStatusResponse>(statusHttp.body())
+            assertEquals(2, status.devices.size)
+            assertEquals(secondAddress, status.deviceAddress)
+            assertTrue(status.connected)
+            assertFalse(status.devices[0].connected)
+            assertTrue(status.devices[1].connected)
+
+            // Releasing an unmanaged device must be rejected with 409 Conflict
+            val unmanagedReq = HmacSigner.signRequest(
+                psk = testPsk,
+                request = GrabRequest(
+                    deviceAddress = unmanagedAddress,
+                    requesterId = "pc-linux",
+                    timestampEpochSec = fixedNow,
+                    nonce = "00001111222233334444555566667777",
+                ),
+            )
+            val unmanagedResp = postRelease(port, ProtocolJson.encodeRequest(unmanagedReq))
+            assertEquals(409, unmanagedResp.statusCode())
+            assertTrue(controller.disconnectCalls.isEmpty())
+
+            // Releasing the second connected managed device disconnects only that address
+            val releaseSecondReq = HmacSigner.signRequest(
+                psk = testPsk,
+                request = GrabRequest(
+                    deviceAddress = secondAddress.lowercase(),
+                    requesterId = "pc-linux",
+                    timestampEpochSec = fixedNow,
+                    nonce = "88889999aaaabbbbccccddddeeeeffff",
+                ),
+            )
+            val releaseSecondResp = postRelease(port, ProtocolJson.encodeRequest(releaseSecondReq))
+            assertEquals(200, releaseSecondResp.statusCode())
+            assertEquals(listOf(secondAddress), controller.disconnectCalls)
+        } finally {
+            server.stop()
+        }
+    }
+
     private fun postRelease(port: Int, jsonBody: String): HttpResponse<String> {
         val client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(2))

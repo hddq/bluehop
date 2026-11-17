@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "BlueHopNsdDiscovery"
@@ -26,6 +27,9 @@ data class DiscoveredBlueHopPeer(
     val displayName: String,
     val pairingAvailable: Boolean,
     val connectedBluetoothAddress: String?,
+    val connectedBluetoothAddresses: Set<String> = connectedBluetoothAddress
+        ?.let { setOf(it.uppercase(Locale.ROOT)) }
+        ?: emptySet(),
 ) {
     val stableKey: String
         get() = deviceId?.takeIf { it.isNotBlank() } ?: "$serviceName@$host:$port"
@@ -213,7 +217,18 @@ class NsdPeerDiscovery(
             val deviceId = attrs["id"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
             val attrName = attrs["name"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
             val pairing = attrs["pair"]?.toString(Charsets.UTF_8) == "1"
-            val btAddress = attrs["device"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+            val singleDevice = attrs["device"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+            val devicesAttr = attrs["devices"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+            val allAddresses = buildSet {
+                devicesAttr?.split(',')
+                    ?.map { it.trim().uppercase(Locale.ROOT) }
+                    ?.filter { it.isNotEmpty() }
+                    ?.let(::addAll)
+                singleDevice?.split(',')
+                    ?.map { it.trim().uppercase(Locale.ROOT) }
+                    ?.filter { it.isNotEmpty() }
+                    ?.let(::addAll)
+            }
             val serviceName = serviceInfo.serviceName.orEmpty()
             return DiscoveredBlueHopPeer(
                 serviceName = serviceName,
@@ -222,7 +237,8 @@ class NsdPeerDiscovery(
                 deviceId = deviceId,
                 displayName = attrName ?: serviceName.ifBlank { hostAddress },
                 pairingAvailable = pairing,
-                connectedBluetoothAddress = btAddress,
+                connectedBluetoothAddress = singleDevice ?: allAddresses.firstOrNull(),
+                connectedBluetoothAddresses = allAddresses,
             )
         }
 

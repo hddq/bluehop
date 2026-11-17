@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
+import kotlinx.serialization.Serializable
 
 data class BondedBluetoothDevice(
     val name: String,
@@ -14,6 +15,7 @@ data class BondedBluetoothDevice(
     val isAudioDevice: Boolean,
 )
 
+@Serializable
 data class SelectedBluetoothDevice(
     val name: String,
     val address: String,

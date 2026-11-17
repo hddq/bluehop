@@ -39,6 +39,15 @@ import java.net.BindException
 import java.util.Locale
 
 @Serializable
+data class HolderDeviceStatus(
+    val deviceAddress: String,
+    val deviceName: String?,
+    val connected: Boolean,
+    val bredrConnected: Boolean,
+    val leConnected: Boolean,
+)
+
+@Serializable
 data class HolderStatusResponse(
     val version: Int = PROTOCOL_VERSION,
     val deviceAddress: String?,
@@ -49,13 +58,17 @@ data class HolderStatusResponse(
     val port: Int,
     val holderId: String? = null,
     val holderName: String? = null,
+    val devices: List<HolderDeviceStatus> = emptyList(),
 )
 
 class HolderHttpServer(
     private val host: String = DEFAULT_HOST,
     private val preferredPort: Int = DEFAULT_PORT,
     private val deviceStates: StateFlow<Map<String, DeviceState>>,
-    private val selectedDeviceProvider: suspend () -> SelectedBluetoothDevice?,
+    private val selectedDeviceProvider: suspend () -> SelectedBluetoothDevice? = { null },
+    private val managedDevicesProvider: suspend () -> List<SelectedBluetoothDevice> = {
+        listOfNotNull(selectedDeviceProvider())
+    },
     private val isDeviceConnected: (String) -> Boolean,
     private val bluetoothController: BluetoothController,
     private val pskStore: PskStore,
@@ -119,20 +132,31 @@ class HolderHttpServer(
         ) {
             routing {
                 get("/status") {
-                    val selected = selectedDeviceProvider()
-                    val state = selected?.address?.let { findDeviceState(deviceStates.value, it) }
-                    val connected = state?.isConnected
-                        ?: selected?.address?.let { isDeviceConnected(it.uppercase(Locale.ROOT)) }
-                        ?: false
+                    val managed = managedDevicesProvider()
+                    val deviceStatuses = managed.map { device ->
+                        val state = findDeviceState(deviceStates.value, device.address)
+                        val connected = state?.isConnected
+                            ?: isDeviceConnected(device.address.uppercase(Locale.ROOT))
+                        HolderDeviceStatus(
+                            deviceAddress = device.address,
+                            deviceName = device.name,
+                            connected = connected,
+                            bredrConnected = state?.bredrConnected ?: false,
+                            leConnected = state?.leConnected ?: false,
+                        )
+                    }
+                    val primary = deviceStatuses.firstOrNull { it.connected }
+                        ?: deviceStatuses.firstOrNull()
                     val payload = HolderStatusResponse(
-                        deviceAddress = selected?.address,
-                        deviceName = selected?.name,
-                        connected = connected,
-                        bredrConnected = state?.bredrConnected ?: false,
-                        leConnected = state?.leConnected ?: false,
+                        deviceAddress = primary?.deviceAddress,
+                        deviceName = primary?.deviceName,
+                        connected = primary?.connected ?: false,
+                        bredrConnected = primary?.bredrConnected ?: false,
+                        leConnected = primary?.leConnected ?: false,
                         port = boundPort,
                         holderId = holderIdProvider(),
                         holderName = holderNameProvider(),
+                        devices = deviceStatuses,
                     )
                     call.respondText(
                         text = ProtocolJson.codec.encodeToString(payload),
@@ -207,9 +231,10 @@ class HolderHttpServer(
             }
         }
 
-        val selected = selectedDeviceProvider()
-        if (selected != null && !selected.address.equals(request.deviceAddress, ignoreCase = true)) {
-            onLog("Rejected /release for ${request.deviceAddress}: selected device is ${selected.address}")
+        val managed = managedDevicesProvider()
+        val matched = managed.firstOrNull { it.address.equals(request.deviceAddress, ignoreCase = true) }
+        if (matched == null) {
+            onLog("Rejected /release for ${request.deviceAddress}: not in managed devices (${managed.map { it.address }})")
             respondSigned(
                 call = call,
                 httpStatus = HttpStatusCode.Conflict,
@@ -217,12 +242,12 @@ class HolderHttpServer(
                 status = GrabResponseStatus.REJECTED,
                 deviceAddress = request.deviceAddress,
                 nonce = request.nonce,
-                message = "Requested device is not the selected device",
+                message = "Requested device is not enabled on this host",
             )
             return
         }
 
-        val targetAddress = (selected?.address ?: request.deviceAddress).uppercase(Locale.ROOT)
+        val targetAddress = matched.address.uppercase(Locale.ROOT)
         if (!isCurrentlyConnected(targetAddress)) {
             onLog("Rejected /release for $targetAddress: device is not connected")
             respondSigned(

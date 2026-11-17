@@ -477,4 +477,122 @@ class GrabFlowTest {
         )
         assertEquals(HopOutcome.NeedsAssociation, assocOutcome)
     }
+
+    @Test
+    fun `hops specific device when holder advertises multiple connected devices`() = runBlocking {
+        val secondMac = "11:22:33:44:55:66"
+        val events = mutableListOf<String>()
+        val holderStates = MutableStateFlow(
+            mapOf(
+                headphoneMac to DeviceState(bredrConnected = true),
+                secondMac to DeviceState(bredrConnected = true),
+            ),
+        )
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = holderStates,
+            managedDevicesProvider = {
+                listOf(
+                    SelectedBluetoothDevice("WH-1000XM4", headphoneMac),
+                    SelectedBluetoothDevice("Pixel Buds Pro 2", secondMac),
+                )
+            },
+            isDeviceConnected = { addr -> holderStates.value[addr]?.isConnected == true },
+            bluetoothController = RecordingBluetoothController(
+                events = events,
+                onDisconnect = { addr ->
+                    holderStates.value = holderStates.value + (addr to DeviceState())
+                },
+            ),
+            pskStore = InMemoryPskStore(),
+            peerPskResolver = { requesterId ->
+                if (requesterId == requesterIdentity.deviceId) sharedPsk else null
+            },
+            holderIdProvider = { holderIdentity.deviceId },
+            holderNameProvider = { holderIdentity.deviceName },
+            verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow }),
+            nowEpochSeconds = { fixedNow },
+            pollIntervalMs = 20L,
+        )
+
+        val port = server.start()
+        try {
+            val coordinator = HopCoordinator(
+                bluetoothController = RecordingBluetoothController(events = events),
+                holderClient = GrabClient(
+                    verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow }),
+                    nowEpochSeconds = { fixedNow },
+                ),
+                profileConfirmation = FakeProfileConfirmation(result = true, events = events),
+                discoveryWaitTimeoutMs = 0L,
+            )
+
+            // Advertise both devices via connectedBluetoothAddresses
+            val peersFlow = MutableStateFlow(
+                listOf(
+                    DiscoveredBlueHopPeer(
+                        serviceName = "BlueHop - Pixel 9",
+                        host = "127.0.0.1",
+                        port = port,
+                        deviceId = holderIdentity.deviceId,
+                        displayName = holderIdentity.deviceName,
+                        pairingAvailable = false,
+                        connectedBluetoothAddress = headphoneMac,
+                        connectedBluetoothAddresses = setOf(headphoneMac, secondMac),
+                    ),
+                ),
+            )
+
+            val directMultiOutcome = coordinator.hopToDevice(
+                targetAddress = secondMac,
+                targetName = "Pixel Buds Pro 2",
+                isAudioDevice = true,
+                isLocallyConnected = false,
+                localIdentity = requesterIdentity,
+                peersFlow = peersFlow,
+                hasPairedPeers = true,
+                peerPskProvider = { sharedPsk },
+            )
+            assertEquals(HopOutcome.Connected(releasedFromHolderName = "Pixel 9"), directMultiOutcome)
+
+            // Also verify status.devices fallback finds headphoneMac when TXT omits devices
+            peersFlow.value = listOf(
+                DiscoveredBlueHopPeer(
+                    serviceName = "BlueHop - Pixel 9",
+                    host = "127.0.0.1",
+                    port = port,
+                    deviceId = holderIdentity.deviceId,
+                    displayName = holderIdentity.deviceName,
+                    pairingAvailable = false,
+                    connectedBluetoothAddress = null,
+                    connectedBluetoothAddresses = emptySet(),
+                ),
+            )
+            val fallbackMultiOutcome = coordinator.hopToDevice(
+                targetAddress = headphoneMac,
+                targetName = "WH-1000XM4",
+                isAudioDevice = true,
+                isLocallyConnected = false,
+                localIdentity = requesterIdentity,
+                peersFlow = peersFlow,
+                hasPairedPeers = true,
+                peerPskProvider = { sharedPsk },
+            )
+            assertEquals(HopOutcome.Connected(releasedFromHolderName = "Pixel 9"), fallbackMultiOutcome)
+            assertEquals(
+                listOf(
+                    "disconnect:$secondMac",
+                    "confirm:$secondMac:true",
+                    "connect:$secondMac",
+                    "disconnect:$headphoneMac",
+                    "confirm:$headphoneMac:true",
+                    "connect:$headphoneMac",
+                ),
+                events,
+            )
+        } finally {
+            server.stop()
+        }
+    }
 }

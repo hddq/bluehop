@@ -27,6 +27,7 @@ class NsdAdvertiser(
     fun start(
         port: Int,
         deviceAddress: String? = null,
+        deviceAddresses: List<String> = emptyList(),
         deviceId: String? = null,
         deviceName: String? = null,
         pairing: Boolean = false,
@@ -49,6 +50,19 @@ class NsdAdvertiser(
 
         acquireMulticastLock()
 
+        val mergedAddresses = buildList {
+            if (!deviceAddress.isNullOrBlank()) {
+                add(deviceAddress.trim().uppercase(java.util.Locale.ROOT))
+            }
+            for (addr in deviceAddresses) {
+                val trimmed = addr.trim().uppercase(java.util.Locale.ROOT)
+                if (trimmed.isNotEmpty() && !contains(trimmed)) {
+                    add(trimmed)
+                }
+            }
+        }
+        val packedDevicesAttr = packDevicesAttribute(mergedAddresses)
+
         val resolvedServiceName = buildServiceName(deviceName, pairing)
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = resolvedServiceName
@@ -61,8 +75,11 @@ class NsdAdvertiser(
             if (!deviceName.isNullOrBlank()) {
                 setAttribute("name", deviceName)
             }
-            if (!deviceAddress.isNullOrBlank()) {
-                setAttribute("device", deviceAddress)
+            if (mergedAddresses.isNotEmpty()) {
+                setAttribute("device", mergedAddresses.first())
+            }
+            if (packedDevicesAttr != null) {
+                setAttribute("devices", packedDevicesAttr)
             }
             if (pairing) {
                 setAttribute("pair", "1")
@@ -159,6 +176,18 @@ class NsdAdvertiser(
             }
             val full = if (pairing) "$base (pair)" else base
             return full.take(MAX_SERVICE_NAME_LENGTH)
+        }
+
+        internal fun packDevicesAttribute(addresses: List<String>, maxBytes: Int = 240): String? {
+            if (addresses.isEmpty()) return null
+            val builder = StringBuilder()
+            for (addr in addresses) {
+                val nextLen = if (builder.isEmpty()) addr.length else builder.length + 1 + addr.length
+                if (nextLen > maxBytes) break
+                if (builder.isNotEmpty()) builder.append(',')
+                builder.append(addr)
+            }
+            return builder.toString().takeIf { it.isNotEmpty() }
         }
     }
 }

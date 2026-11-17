@@ -76,8 +76,8 @@ class SelectedDeviceRepositoryTest {
     }
 
     @Test
-    fun selectingAnotherDeviceOverwritesPreviousAndClearRemovesIt() = runTest {
-        val file = tempFolder.newFile("overwrite_device.preferences_pb")
+    fun managingMultipleDevicesAndTogglingOneOffPreservesOthers() = runTest {
+        val file = tempFolder.newFile("multi_device.preferences_pb")
         val scope = CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
         try {
             val dataStore = PreferenceDataStoreFactory.create(
@@ -87,16 +87,49 @@ class SelectedDeviceRepositoryTest {
             val repository = SelectedDeviceRepository(dataStore)
 
             val first = SelectedBluetoothDevice("First Buds", "11:22:33:44:55:66")
-            val second = SelectedBluetoothDevice("Studio Headphones", "AA:BB:CC:DD:EE:FF")
+            val second = SelectedBluetoothDevice("Studio Headphones", "aa:bb:cc:dd:ee:ff")
+            val expectedSecond = second.copy(address = "AA:BB:CC:DD:EE:FF")
 
-            repository.selectDevice(first)
+            repository.setDeviceManaged(first, managed = true)
+            repository.setDeviceManaged(second, managed = true)
+            assertEquals(listOf(first, expectedSecond), repository.managedDevices.first())
             assertEquals(first, repository.selectedDevice.first())
 
-            repository.selectDevice(second)
-            assertEquals(second, repository.selectedDevice.first())
+            repository.setDeviceManaged(first, managed = false)
+            assertEquals(listOf(expectedSecond), repository.managedDevices.first())
+            assertEquals(expectedSecond, repository.selectedDevice.first())
 
             repository.clearSelectedDevice()
+            assertEquals(emptyList<SelectedBluetoothDevice>(), repository.managedDevices.first())
             assertNull(repository.selectedDevice.first())
+        } finally {
+            scope.cancel()
+            scope.coroutineContext[Job]?.join()
+        }
+    }
+
+    @Test
+    fun legacySingleDeviceKeysMigrateAutomatically() = runTest {
+        val file = tempFolder.newFile("legacy_device.preferences_pb")
+        val scope = CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+        try {
+            val dataStore = PreferenceDataStoreFactory.create(
+                scope = scope,
+                produceFile = { file },
+            )
+            dataStore.updateData { prefs ->
+                prefs.toMutablePreferences().apply {
+                    this[androidx.datastore.preferences.core.stringPreferencesKey("selected_device_name")] = "WH-1000XM4"
+                    this[androidx.datastore.preferences.core.stringPreferencesKey("selected_device_address")] = "ac:80:0a:cd:82:a1"
+                }
+            }
+            val repository = SelectedDeviceRepository(dataStore)
+            val legacy = SelectedBluetoothDevice("WH-1000XM4", "AC:80:0A:CD:82:A1")
+            assertEquals(listOf(legacy), repository.managedDevices.first())
+
+            val buds = SelectedBluetoothDevice("Pixel Buds", "11:22:33:44:55:66")
+            repository.setDeviceManaged(buds, managed = true)
+            assertEquals(listOf(legacy, buds), repository.managedDevices.first())
         } finally {
             scope.cancel()
             scope.coroutineContext[Job]?.join()

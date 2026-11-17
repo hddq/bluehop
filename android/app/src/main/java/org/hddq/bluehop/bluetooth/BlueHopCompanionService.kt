@@ -50,6 +50,7 @@ class BlueHopCompanionService : CompanionDeviceService() {
     private lateinit var nsdAdvertiser: NsdAdvertiser
 
     private var holderActive = false
+    private var advertisedAddresses: List<String> = emptyList()
     private var stopJob: Job? = null
 
     override fun onCreate() {
@@ -67,6 +68,7 @@ class BlueHopCompanionService : CompanionDeviceService() {
         holderServer = HolderHttpServer(
             deviceStates = stateObserver.deviceStates,
             selectedDeviceProvider = { selectedDeviceRepository.selectedDevice.first() },
+            managedDevicesProvider = { selectedDeviceRepository.managedDevices.first() },
             isDeviceConnected = { address -> isDeviceCurrentlyConnected(address) },
             bluetoothController = bluetoothController,
             pskStore = pskStore,
@@ -83,9 +85,13 @@ class BlueHopCompanionService : CompanionDeviceService() {
         Log.i(TAG, "CompanionDeviceService created (bound)")
 
         serviceScope.launch {
-            val selected = selectedDeviceRepository.selectedDevice.first()
-            if (selected != null && isDeviceCurrentlyConnected(selected.address)) {
-                ensureHolderActive(selected.address)
+            selectedDeviceRepository.managedDevices.collect {
+                syncHolderState()
+            }
+        }
+        serviceScope.launch {
+            stateObserver.deviceStates.collect {
+                syncHolderState()
             }
         }
     }
@@ -124,7 +130,7 @@ class BlueHopCompanionService : CompanionDeviceService() {
                 serviceScope.launch {
                     stateObserver.refresh()
                     val address = resolveDeviceAddress(event.associationId)
-                    ensureHolderActive(address)
+                    syncHolderState(forceIncludeAddress = address)
                 }
             }
 
@@ -136,33 +142,49 @@ class BlueHopCompanionService : CompanionDeviceService() {
                 stopJob = serviceScope.launch {
                     holderServer.awaitIdle(4_000L)
                     stateObserver.refresh()
-                    val selected = selectedDeviceRepository.selectedDevice.first()
-                    if (selected == null || !isDeviceCurrentlyConnected(selected.address)) {
-                        stopHolder()
-                    }
+                    syncHolderState()
                 }
             }
         }
     }
 
-    private suspend fun ensureHolderActive(deviceAddress: String?) {
+    private suspend fun syncHolderState(forceIncludeAddress: String? = null) {
+        if (holderActive && resolveConnectedManagedAddresses(forceIncludeAddress).isEmpty()) {
+            holderServer.awaitIdle(4_000L)
+        }
         lifecycleMutex.withLock {
-            if (holderActive) return
-            val identity = pairedPeersRepository.getOrCreateIdentity()
-            val port = holderServer.start()
-            nsdAdvertiser.start(
-                port = port,
-                deviceAddress = deviceAddress,
-                deviceId = identity.deviceId,
-                deviceName = identity.deviceName,
-                pairing = false,
-            )
-            holderActive = true
-            val ips = localIpv4Addresses().joinToString().ifEmpty { "none" }
-            Log.i(
-                TAG,
-                "Holder active on port=$port ips=[$ips] id=${identity.deviceId} device=${deviceAddress ?: "any"}",
-            )
+            val connected = resolveConnectedManagedAddresses(forceIncludeAddress)
+            if (connected.isEmpty()) {
+                if (holderActive) {
+                    holderActive = false
+                    advertisedAddresses = emptyList()
+                    nsdAdvertiser.stop()
+                    holderServer.stop()
+                    Log.i(TAG, "Holder stopped")
+                }
+                return
+            }
+
+            stopJob?.cancel()
+            stopJob = null
+            if (!holderActive || advertisedAddresses != connected) {
+                val identity = pairedPeersRepository.getOrCreateIdentity()
+                val port = holderServer.start()
+                nsdAdvertiser.start(
+                    port = port,
+                    deviceAddresses = connected,
+                    deviceId = identity.deviceId,
+                    deviceName = identity.deviceName,
+                    pairing = false,
+                )
+                holderActive = true
+                advertisedAddresses = connected
+                val ips = localIpv4Addresses().joinToString().ifEmpty { "none" }
+                Log.i(
+                    TAG,
+                    "Holder active on port=$port ips=[$ips] id=${identity.deviceId} devices=${connected.joinToString()}",
+                )
+            }
         }
     }
 
@@ -170,19 +192,29 @@ class BlueHopCompanionService : CompanionDeviceService() {
         lifecycleMutex.withLock {
             if (!holderActive) return
             holderActive = false
+            advertisedAddresses = emptyList()
             nsdAdvertiser.stop()
             holderServer.stop()
             Log.i(TAG, "Holder stopped")
         }
     }
 
-    private suspend fun resolveDeviceAddress(associationId: Int): String? {
+    private suspend fun resolveConnectedManagedAddresses(
+        forceIncludeAddress: String? = null,
+    ): List<String> = selectedDeviceRepository.managedDevices.first()
+        .map { it.address.uppercase(Locale.ROOT) }
+        .distinct()
+        .filter { address ->
+            (forceIncludeAddress != null && address.equals(forceIncludeAddress, ignoreCase = true)) ||
+                isDeviceCurrentlyConnected(address)
+        }
+
+    private fun resolveDeviceAddress(associationId: Int): String? {
         val companionDeviceManager = getSystemService(CompanionDeviceManager::class.java)
-        val fromAssociation = companionDeviceManager?.myAssociations
+        return companionDeviceManager?.myAssociations
             ?.firstOrNull { it.id == associationId }
             ?.deviceMacAddress
             ?.toString()
-        return fromAssociation ?: selectedDeviceRepository.selectedDevice.first()?.address
     }
 
     @SuppressLint("MissingPermission")
@@ -227,27 +259,41 @@ internal data class AssociationEntry(
 )
 
 internal data class AssociationSyncPlan(
-    val keepAssociationId: Int?,
+    val keepAssociationIds: List<Int>,
     val stopObservingIds: List<Int>,
     val disassociateIds: List<Int>,
 )
 
 internal fun buildAssociationSyncPlan(
     associations: List<AssociationEntry>,
-    targetAddress: String,
+    targetAddresses: Set<String>,
 ): AssociationSyncPlan {
-    val matching = associations.filter { entry ->
-        entry.address?.equals(targetAddress, ignoreCase = true) == true
+    val normalizedTargets = targetAddresses
+        .map { it.trim().uppercase(Locale.ROOT) }
+        .filter { it.isNotEmpty() }
+        .toSet()
+
+    val keepIds = mutableListOf<Int>()
+    val stopIds = mutableListOf<Int>()
+    val duplicateIds = mutableListOf<Int>()
+    val keptAddresses = mutableSetOf<String>()
+
+    for (entry in associations) {
+        val normalizedAddress = entry.address?.trim()?.uppercase(Locale.ROOT)
+        if (normalizedAddress != null && normalizedAddress in normalizedTargets) {
+            if (keptAddresses.add(normalizedAddress)) {
+                keepIds += entry.id
+            } else {
+                stopIds += entry.id
+                duplicateIds += entry.id
+            }
+        } else {
+            stopIds += entry.id
+        }
     }
-    val keep = matching.firstOrNull()
-    val stopIds = associations
-        .filter { it.id != keep?.id }
-        .map { it.id }
-    val duplicateIds = matching
-        .drop(1)
-        .map { it.id }
+
     return AssociationSyncPlan(
-        keepAssociationId = keep?.id,
+        keepAssociationIds = keepIds,
         stopObservingIds = stopIds,
         disassociateIds = duplicateIds,
     )
@@ -276,9 +322,9 @@ internal fun findAssociationForAddress(
     association.deviceMacAddress?.toString()?.equals(address, ignoreCase = true) == true
 }
 
-fun syncObservedCompanionDevice(
+fun syncObservedCompanionDevices(
     context: Context,
-    targetAddress: String,
+    targetAddresses: Set<String>,
 ) {
     if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_COMPANION_DEVICE_SETUP)) {
         return
@@ -289,7 +335,7 @@ fun syncObservedCompanionDevice(
     val associations = companionDeviceManager.myAssociations
     val plan = buildAssociationSyncPlan(
         associations = associations.map { AssociationEntry(it.id, it.deviceMacAddress?.toString()) },
-        targetAddress = targetAddress,
+        targetAddresses = targetAddresses,
     )
 
     for (associationId in plan.stopObservingIds) {
@@ -306,15 +352,17 @@ fun syncObservedCompanionDevice(
     for (duplicateId in plan.disassociateIds) {
         runCatching {
             companionDeviceManager.disassociate(duplicateId)
-            Log.i(TAG, "Removed duplicate associationId=$duplicateId for $targetAddress")
+            Log.i(TAG, "Removed duplicate associationId=$duplicateId")
         }.onFailure { error ->
             Log.w(TAG, "Failed to disassociate duplicate associationId=$duplicateId", error)
         }
     }
 
-    val keepAssociation = associations.firstOrNull { it.id == plan.keepAssociationId }
-    if (keepAssociation != null) {
-        startObservingAssociation(companionDeviceManager, keepAssociation)
+    val keepIdSet = plan.keepAssociationIds.toSet()
+    for (association in associations) {
+        if (association.id in keepIdSet) {
+            startObservingAssociation(companionDeviceManager, association)
+        }
     }
 }
 
