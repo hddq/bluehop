@@ -94,6 +94,8 @@ import org.hddq.bluehop.data.SelectedDeviceRepository
 import org.hddq.bluehop.permissions.ManagedPermission
 import org.hddq.bluehop.permissions.PermissionGrantStatus
 import org.hddq.bluehop.permissions.resolvePermissionStatus
+import org.hddq.bluehop.protocol.PairedPeerSummary
+import org.hddq.bluehop.protocol.PairedPeersRepository
 import org.hddq.bluehop.ui.theme.BlueHopTheme
 
 @Composable
@@ -104,6 +106,7 @@ fun MainRoute(
     val activity = LocalActivity.current
     val coroutineScope = rememberCoroutineScope()
     val repository = remember(context) { SelectedDeviceRepository.from(context) }
+    val pairedPeersRepository = remember(context) { PairedPeersRepository.from(context) }
     val bluetoothController: BluetoothController = remember(context) {
         Api37BluetoothController(context.applicationContext)
     }
@@ -120,8 +123,10 @@ fun MainRoute(
     }
 
     val selectedDevice by repository.selectedDevice.collectAsStateWithLifecycle(initialValue = null)
+    val pairedPeers by pairedPeersRepository.peerSummaries.collectAsStateWithLifecycle(initialValue = emptyList())
     val deviceStates by stateObserver.deviceStates.collectAsStateWithLifecycle()
     var debugControlStatus by remember { mutableStateOf<String?>(null) }
+    var showPairingDialog by rememberSaveable { mutableStateOf(false) }
 
     var pendingPermissionRequest by rememberSaveable { mutableStateOf<String?>(null) }
     var hasRequestedNearbyDevices by rememberSaveable { mutableStateOf(false) }
@@ -356,7 +361,40 @@ fun MainRoute(
                 }
             }
         },
+        pairedPeers = pairedPeers,
+        canPairHosts = isLocalNetworkGranted,
+        onPairHostClick = {
+            if (isLocalNetworkGranted) {
+                showPairingDialog = true
+            } else {
+                val localNetPermission = permissions.firstOrNull {
+                    it.permission == Manifest.permission.ACCESS_LOCAL_NETWORK
+                }
+                if (localNetPermission != null) {
+                    when (localNetPermission.status) {
+                        PermissionGrantStatus.GRANTED -> showPairingDialog = true
+                        PermissionGrantStatus.NOT_GRANTED -> {
+                            pendingPermissionRequest = localNetPermission.permission
+                            permissionLauncher.launch(localNetPermission.permission)
+                        }
+                        PermissionGrantStatus.PERMANENTLY_DENIED -> context.openAppSettings()
+                    }
+                }
+            }
+        },
+        onRemovePairedPeerClick = { peer ->
+            coroutineScope.launch {
+                pairedPeersRepository.removePeer(peer.peerId)
+            }
+        },
     )
+
+    if (showPairingDialog) {
+        PairingDialog(
+            pairedPeersRepository = pairedPeersRepository,
+            onDismiss = { showPairingDialog = false },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
@@ -374,6 +412,10 @@ fun MainScreen(
     debugControlStatus: String? = null,
     onConnectClick: () -> Unit = {},
     onDisconnectClick: () -> Unit = {},
+    pairedPeers: List<PairedPeerSummary> = emptyList(),
+    canPairHosts: Boolean = true,
+    onPairHostClick: () -> Unit = {},
+    onRemovePairedPeerClick: (PairedPeerSummary) -> Unit = {},
 ) {
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -532,6 +574,71 @@ fun MainScreen(
                                 )
                             }
                         }
+                    }
+                }
+
+                item(key = "paired_hosts_spacer") {
+                    Spacer(modifier = Modifier.height(14.dp))
+                }
+
+                item(key = "paired_hosts_header") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SectionHeader(
+                            title = stringResource(R.string.paired_hosts_section_title),
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (canPairHosts || pairedPeers.isNotEmpty()) {
+                            FilledTonalButton(
+                                onClick = onPairHostClick,
+                                shapes = ButtonDefaults.shapes(),
+                            ) {
+                                Text(text = stringResource(R.string.paired_hosts_action_pair))
+                            }
+                        }
+                    }
+                }
+
+                if (!canPairHosts && pairedPeers.isEmpty()) {
+                    item(key = "paired_hosts_permission_required") {
+                        DeviceStateListItem(
+                            iconRes = R.drawable.ic_devices,
+                            title = stringResource(R.string.bluetooth_devices_permission_required_title),
+                            description = stringResource(R.string.paired_hosts_permission_required_description),
+                            actionLabel = permissions.firstOrNull {
+                                it.permission == Manifest.permission.ACCESS_LOCAL_NETWORK
+                            }?.let { permission ->
+                                when (permission.status) {
+                                    PermissionGrantStatus.GRANTED -> null
+                                    PermissionGrantStatus.NOT_GRANTED -> stringResource(R.string.permission_action_allow)
+                                    PermissionGrantStatus.PERMANENTLY_DENIED -> stringResource(R.string.permission_action_open_settings)
+                                }
+                            },
+                            onActionClick = onPairHostClick,
+                        )
+                    }
+                } else if (pairedPeers.isEmpty()) {
+                    item(key = "paired_hosts_empty") {
+                        DeviceStateListItem(
+                            iconRes = R.drawable.ic_devices,
+                            title = stringResource(R.string.paired_hosts_empty_title),
+                            description = stringResource(R.string.paired_hosts_empty_description),
+                        )
+                    }
+                } else {
+                    itemsIndexed(
+                        items = pairedPeers,
+                        key = { _, peer -> "peer_${peer.peerId}" },
+                    ) { index, peer ->
+                        PairedHostListItem(
+                            peer = peer,
+                            index = index,
+                            count = pairedPeers.size,
+                            onRemoveClick = { onRemovePairedPeerClick(peer) },
+                            modifier = Modifier.animateItem(),
+                        )
                     }
                 }
 
@@ -848,6 +955,66 @@ private fun DeviceStateListItem(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
+private fun PairedHostListItem(
+    peer: PairedPeerSummary,
+    index: Int,
+    count: Int,
+    onRemoveClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    SegmentedListItem(
+        shapes = ListItemDefaults.segmentedShapes(index = index, count = count),
+        colors = ListItemDefaults.colors(
+            containerColor = MaterialTheme.colorScheme.surfaceBright,
+        ),
+        modifier = modifier,
+        leadingContent = {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_devices),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        },
+        supportingContent = {
+            Text(
+                text = stringResource(R.string.paired_hosts_id_format, peer.peerId),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        trailingContent = {
+            IconButton(
+                onClick = onRemoveClick,
+                shapes = IconButtonDefaults.shapes(),
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_close),
+                    contentDescription = stringResource(R.string.paired_hosts_action_remove),
+                )
+            }
+        },
+        content = {
+            Text(
+                text = peer.peerName,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
 private fun DebugBluetoothControls(
     enabled: Boolean,
     statusMessage: String?,
@@ -993,6 +1160,13 @@ private fun MainScreenWithDevicesPreview() {
                 "AA:BB:CC:DD:EE:01" to DeviceState(bredrConnected = true),
                 "AA:BB:CC:DD:EE:02" to DeviceState(),
                 "AA:BB:CC:DD:EE:03" to DeviceState(leConnected = true),
+            ),
+            pairedPeers = listOf(
+                PairedPeerSummary(
+                    peerId = "8f4b2c1a-9d0e-4f1a-8b2c-1234567890ab",
+                    peerName = "Pixel 9 Pro",
+                    pairedAtEpochSec = 1_760_000_000L,
+                ),
             ),
         )
     }

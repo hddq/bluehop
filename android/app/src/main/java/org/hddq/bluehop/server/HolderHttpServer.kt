@@ -47,6 +47,8 @@ data class HolderStatusResponse(
     val bredrConnected: Boolean,
     val leConnected: Boolean,
     val port: Int,
+    val holderId: String? = null,
+    val holderName: String? = null,
 )
 
 class HolderHttpServer(
@@ -57,6 +59,11 @@ class HolderHttpServer(
     private val isDeviceConnected: (String) -> Boolean,
     private val bluetoothController: BluetoothController,
     private val pskStore: PskStore,
+    private val peerPskResolver: suspend (requesterId: String) -> ByteArray? = {
+        pskStore.getOrCreatePsk()
+    },
+    private val holderIdProvider: suspend () -> String? = { null },
+    private val holderNameProvider: suspend () -> String? = { null },
     private val verifier: ProtocolVerifier = ProtocolVerifier(),
     private val nowEpochSeconds: () -> Long = { System.currentTimeMillis() / 1_000L },
     private val disconnectRetryDelayMs: Long = DEFAULT_DISCONNECT_RETRY_DELAY_MS,
@@ -124,6 +131,8 @@ class HolderHttpServer(
                         bredrConnected = state?.bredrConnected ?: false,
                         leConnected = state?.leConnected ?: false,
                         port = boundPort,
+                        holderId = holderIdProvider(),
+                        holderName = holderNameProvider(),
                     )
                     call.respondText(
                         text = ProtocolJson.codec.encodeToString(payload),
@@ -144,30 +153,39 @@ class HolderHttpServer(
         }.start(wait = false)
 
     private suspend fun handleRelease(call: io.ktor.server.routing.RoutingCall) {
-        val psk = pskStore.getOrCreatePsk()
         val body = call.receiveText()
         val request = try {
             ProtocolJson.decodeRequest(body)
         } catch (_: SerializationException) {
-            respondSigned(
+            respondUnsignedError(
                 call = call,
                 httpStatus = HttpStatusCode.BadRequest,
-                psk = psk,
-                status = GrabResponseStatus.ERROR,
                 deviceAddress = UNKNOWN_DEVICE_ADDRESS,
                 nonce = HmacSigner.generateNonce(),
                 message = "Malformed release request JSON",
             )
             return
         } catch (_: IllegalArgumentException) {
-            respondSigned(
+            respondUnsignedError(
                 call = call,
                 httpStatus = HttpStatusCode.BadRequest,
-                psk = psk,
-                status = GrabResponseStatus.ERROR,
                 deviceAddress = UNKNOWN_DEVICE_ADDRESS,
                 nonce = HmacSigner.generateNonce(),
                 message = "Invalid release request payload",
+            )
+            return
+        }
+
+        val psk = peerPskResolver(request.requesterId)
+        if (psk == null) {
+            onLog("Rejected /release from unknown requester ${request.requesterId}")
+            respondUnsignedError(
+                call = call,
+                httpStatus = HttpStatusCode.Unauthorized,
+                deviceAddress = request.deviceAddress,
+                nonce = request.nonce,
+                message = "UNKNOWN_REQUESTER",
+                status = GrabResponseStatus.REJECTED,
             )
             return
         }
@@ -280,6 +298,28 @@ class HolderHttpServer(
                 nonce = nonce,
                 message = message,
             ),
+        )
+        call.respondText(
+            text = ProtocolJson.encodeResponse(response),
+            contentType = ContentType.Application.Json,
+            status = httpStatus,
+        )
+    }
+
+    private suspend fun respondUnsignedError(
+        call: io.ktor.server.routing.RoutingCall,
+        httpStatus: HttpStatusCode,
+        deviceAddress: String,
+        nonce: String,
+        message: String,
+        status: GrabResponseStatus = GrabResponseStatus.ERROR,
+    ) {
+        val response = GrabResponse(
+            status = status,
+            deviceAddress = deviceAddress,
+            timestampEpochSec = nowEpochSeconds(),
+            nonce = nonce,
+            message = message,
         )
         call.respondText(
             text = ProtocolJson.encodeResponse(response),

@@ -60,6 +60,47 @@ sealed interface VerificationResult {
     data class Invalid(val reason: VerificationFailureReason) : VerificationResult
 }
 
+@Serializable
+data class PairInfoResponse(
+    val version: Int = PROTOCOL_VERSION,
+    val responderId: String,
+    val responderName: String,
+    val responderPublicKeyBase64: String,
+    val sessionNonce: String,
+)
+
+@Serializable
+data class PairRequest(
+    val version: Int = PROTOCOL_VERSION,
+    val requesterId: String,
+    val requesterName: String,
+    val requesterPublicKeyBase64: String,
+    val sessionNonce: String,
+    val proof: String,
+)
+
+@Serializable
+enum class PairResponseStatus(val wireValue: String) {
+    @SerialName("ok")
+    OK("ok"),
+
+    @SerialName("rejected")
+    REJECTED("rejected"),
+
+    @SerialName("error")
+    ERROR("error"),
+}
+
+@Serializable
+data class PairResponse(
+    val version: Int = PROTOCOL_VERSION,
+    val status: PairResponseStatus,
+    val responderId: String,
+    val responderName: String,
+    val proof: String = "",
+    val message: String = "",
+)
+
 object ProtocolJson {
     val codec = Json {
         encodeDefaults = true
@@ -73,4 +114,16 @@ object ProtocolJson {
     fun encodeResponse(response: GrabResponse): String = codec.encodeToString(response)
 
     fun decodeResponse(json: String): GrabResponse = codec.decodeFromString(json)
+
+    fun encodePairInfo(info: PairInfoResponse): String = codec.encodeToString(info)
+
+    fun decodePairInfo(json: String): PairInfoResponse = codec.decodeFromString(json)
+
+    fun encodePairRequest(request: PairRequest): String = codec.encodeToString(request)
+
+    fun decodePairRequest(json: String): PairRequest = codec.decodeFromString(json)
+
+    fun encodePairResponse(response: PairResponse): String = codec.encodeToString(response)
+
+    fun decodePairResponse(json: String): PairResponse = codec.decodeFromString(json)
 }

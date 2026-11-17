@@ -256,6 +256,107 @@ class HolderHttpServerTest {
         }
     }
 
+    @Test
+    fun `release rejects unknown requester and authenticates using per-peer PSK`() = runBlocking {
+        val peerAPsk = ByteArray(32) { (it + 11).toByte() }
+        val peerBPsk = ByteArray(32) { (it + 77).toByte() }
+        val peerPsks = mapOf(
+            "peer-a" to peerAPsk,
+            "peer-b" to peerBPsk,
+        )
+        val deviceStates = MutableStateFlow(
+            mapOf(testAddress to DeviceState(bredrConnected = true)),
+        )
+        val controller = FakeBluetoothController(
+            onDisconnect = {
+                deviceStates.value = mapOf(testAddress to DeviceState(bredrConnected = false))
+            },
+        )
+        val verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow })
+        val server = HolderHttpServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", testAddress) },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = controller,
+            pskStore = InMemoryPskStore(testPsk),
+            peerPskResolver = { requesterId -> peerPsks[requesterId] },
+            holderIdProvider = { "holder-uuid-1" },
+            holderNameProvider = { "Pixel 9" },
+            verifier = verifier,
+            nowEpochSeconds = { fixedNow },
+        )
+
+        val port = server.start()
+        try {
+            val client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(2))
+                .build()
+            val statusHttp = client.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/status"))
+                    .GET()
+                    .build(),
+                HttpResponse.BodyHandlers.ofString(),
+            )
+            val status = ProtocolJson.codec.decodeFromString<HolderStatusResponse>(statusHttp.body())
+            assertEquals("holder-uuid-1", status.holderId)
+            assertEquals("Pixel 9", status.holderName)
+
+            val unknownReq = HmacSigner.signRequest(
+                psk = testPsk,
+                request = GrabRequest(
+                    deviceAddress = testAddress,
+                    requesterId = "unpaired-device",
+                    timestampEpochSec = fixedNow,
+                    nonce = "aaaa1111bbbb2222cccc3333dddd4444",
+                ),
+            )
+            val unknownResp = postRelease(port, ProtocolJson.encodeRequest(unknownReq))
+            assertEquals(401, unknownResp.statusCode())
+            val unknownBody = ProtocolJson.decodeResponse(unknownResp.body())
+            assertEquals(GrabResponseStatus.REJECTED, unknownBody.status)
+            assertEquals("UNKNOWN_REQUESTER", unknownBody.message)
+            assertEquals("", unknownBody.signature)
+            assertTrue(controller.disconnectCalls.isEmpty())
+
+            // Signed with peer-b's PSK while claiming requesterId = peer-a must fail
+            val wrongKeyReq = HmacSigner.signRequest(
+                psk = peerBPsk,
+                request = GrabRequest(
+                    deviceAddress = testAddress,
+                    requesterId = "peer-a",
+                    timestampEpochSec = fixedNow,
+                    nonce = "eeee1111ffff2222aaaa3333bbbb4444",
+                ),
+            )
+            val wrongKeyResp = postRelease(port, ProtocolJson.encodeRequest(wrongKeyReq))
+            assertEquals(401, wrongKeyResp.statusCode())
+            assertTrue(controller.disconnectCalls.isEmpty())
+
+            // Signed with peer-a's own PSK succeeds and signs response with peer-a's PSK
+            val validReq = HmacSigner.signRequest(
+                psk = peerAPsk,
+                request = GrabRequest(
+                    deviceAddress = testAddress,
+                    requesterId = "peer-a",
+                    timestampEpochSec = fixedNow,
+                    nonce = "12341234123412341234123412341234",
+                ),
+            )
+            val validResp = postRelease(port, ProtocolJson.encodeRequest(validReq))
+            assertEquals(200, validResp.statusCode())
+            val validBody = ProtocolJson.decodeResponse(validResp.body())
+            assertEquals(GrabResponseStatus.OK, validBody.status)
+            assertEquals(
+                VerificationResult.Valid,
+                verifier.verifyResponse(validBody, peerAPsk, validReq.nonce),
+            )
+        } finally {
+            server.stop()
+        }
+    }
+
     private fun postRelease(port: Int, jsonBody: String): HttpResponse<String> {
         val client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(2))

@@ -19,73 +19,22 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-interface PskStore {
-    suspend fun getOrCreatePsk(): ByteArray
-    suspend fun setPsk(psk: ByteArray)
-    suspend fun clearPsk()
+interface SecretBox {
+    fun encrypt(plaintext: ByteArray): Pair<ByteArray, ByteArray>
+    fun decrypt(iv: ByteArray, ciphertext: ByteArray): ByteArray
+    fun deleteKey()
 }
 
-private val Context.pskDataStore: DataStore<Preferences> by preferencesDataStore(
-    name = "bluehop_psk",
-)
-
-class KeystorePskStore(
-    private val dataStore: DataStore<Preferences>,
-    private val keyAlias: String = DEFAULT_KEY_ALIAS,
-    private val random: SecureRandom = SecureRandom(),
-) : PskStore {
-
-    override suspend fun getOrCreatePsk(): ByteArray {
-        val preferences = dataStore.data.firstOrNullSafe()
-        val ivEncoded = preferences[KEY_PSK_IV]
-        val ciphertextEncoded = preferences[KEY_PSK_CIPHERTEXT]
-        if (ivEncoded != null && ciphertextEncoded != null) {
-            val existing = runCatching {
-                decrypt(
-                    iv = Base64.getDecoder().decode(ivEncoded),
-                    ciphertext = Base64.getDecoder().decode(ciphertextEncoded),
-                )
-            }.getOrNull()
-            if (existing != null && existing.size == PSK_BYTE_LENGTH) {
-                return existing
-            }
-        }
-
-        val generated = ByteArray(PSK_BYTE_LENGTH).also(random::nextBytes)
-        setPsk(generated)
-        return generated
-    }
-
-    override suspend fun setPsk(psk: ByteArray) {
-        require(psk.size == PSK_BYTE_LENGTH) {
-            "Expected $PSK_BYTE_LENGTH-byte PSK, got ${psk.size} bytes"
-        }
-        val (iv, ciphertext) = encrypt(psk)
-        val decoder = Base64.getEncoder()
-        dataStore.edit { preferences ->
-            preferences[KEY_PSK_IV] = decoder.encodeToString(iv)
-            preferences[KEY_PSK_CIPHERTEXT] = decoder.encodeToString(ciphertext)
-        }
-    }
-
-    override suspend fun clearPsk() {
-        dataStore.edit { preferences ->
-            preferences.remove(KEY_PSK_IV)
-            preferences.remove(KEY_PSK_CIPHERTEXT)
-        }
-        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        if (keyStore.containsAlias(keyAlias)) {
-            keyStore.deleteEntry(keyAlias)
-        }
-    }
-
-    private fun encrypt(plaintext: ByteArray): Pair<ByteArray, ByteArray> {
+class KeystoreSecretBox(
+    private val keyAlias: String,
+) : SecretBox {
+    override fun encrypt(plaintext: ByteArray): Pair<ByteArray, ByteArray> {
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateWrappingKey())
         return cipher.iv to cipher.doFinal(plaintext)
     }
 
-    private fun decrypt(iv: ByteArray, ciphertext: ByteArray): ByteArray {
+    override fun decrypt(iv: ByteArray, ciphertext: ByteArray): ByteArray {
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         cipher.init(
             Cipher.DECRYPT_MODE,
@@ -93,6 +42,13 @@ class KeystorePskStore(
             GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv),
         )
         return cipher.doFinal(ciphertext)
+    }
+
+    override fun deleteKey() {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        if (keyStore.containsAlias(keyAlias)) {
+            keyStore.deleteEntry(keyAlias)
+        }
     }
 
     private fun getOrCreateWrappingKey(): SecretKey {
@@ -117,6 +73,70 @@ class KeystorePskStore(
         return keyGenerator.generateKey()
     }
 
+    private companion object {
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
+        const val GCM_TAG_LENGTH_BITS = 128
+    }
+}
+
+interface PskStore {
+    suspend fun getOrCreatePsk(): ByteArray
+    suspend fun setPsk(psk: ByteArray)
+    suspend fun clearPsk()
+}
+
+private val Context.pskDataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "bluehop_psk",
+)
+
+class KeystorePskStore(
+    private val dataStore: DataStore<Preferences>,
+    private val secretBox: SecretBox = KeystoreSecretBox(DEFAULT_KEY_ALIAS),
+    private val random: SecureRandom = SecureRandom(),
+) : PskStore {
+
+    override suspend fun getOrCreatePsk(): ByteArray {
+        val preferences = dataStore.data.firstOrNullSafe()
+        val ivEncoded = preferences[KEY_PSK_IV]
+        val ciphertextEncoded = preferences[KEY_PSK_CIPHERTEXT]
+        if (ivEncoded != null && ciphertextEncoded != null) {
+            val existing = runCatching {
+                secretBox.decrypt(
+                    iv = Base64.getDecoder().decode(ivEncoded),
+                    ciphertext = Base64.getDecoder().decode(ciphertextEncoded),
+                )
+            }.getOrNull()
+            if (existing != null && existing.size == PSK_BYTE_LENGTH) {
+                return existing
+            }
+        }
+
+        val generated = ByteArray(PSK_BYTE_LENGTH).also(random::nextBytes)
+        setPsk(generated)
+        return generated
+    }
+
+    override suspend fun setPsk(psk: ByteArray) {
+        require(psk.size == PSK_BYTE_LENGTH) {
+            "Expected $PSK_BYTE_LENGTH-byte PSK, got ${psk.size} bytes"
+        }
+        val (iv, ciphertext) = secretBox.encrypt(psk)
+        val encoder = Base64.getEncoder()
+        dataStore.edit { preferences ->
+            preferences[KEY_PSK_IV] = encoder.encodeToString(iv)
+            preferences[KEY_PSK_CIPHERTEXT] = encoder.encodeToString(ciphertext)
+        }
+    }
+
+    override suspend fun clearPsk() {
+        dataStore.edit { preferences ->
+            preferences.remove(KEY_PSK_IV)
+            preferences.remove(KEY_PSK_CIPHERTEXT)
+        }
+        secretBox.deleteKey()
+    }
+
     private suspend fun kotlinx.coroutines.flow.Flow<Preferences>.firstOrNullSafe(): Preferences =
         try {
             first()
@@ -126,10 +146,7 @@ class KeystorePskStore(
 
     companion object {
         const val PSK_BYTE_LENGTH = 32
-        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val DEFAULT_KEY_ALIAS = "bluehop_psk_wrap_v1"
-        private const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
-        private const val GCM_TAG_LENGTH_BITS = 128
 
         private val KEY_PSK_IV = stringPreferencesKey("psk_iv")
         private val KEY_PSK_CIPHERTEXT = stringPreferencesKey("psk_ciphertext")

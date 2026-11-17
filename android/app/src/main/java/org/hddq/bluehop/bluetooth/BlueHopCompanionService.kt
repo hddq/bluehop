@@ -24,8 +24,10 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import org.hddq.bluehop.BuildConfig
 import org.hddq.bluehop.data.SelectedDeviceRepository
 import org.hddq.bluehop.protocol.KeystorePskStore
+import org.hddq.bluehop.protocol.PairedPeersRepository
 import org.hddq.bluehop.server.HolderHttpServer
 import org.hddq.bluehop.server.NsdAdvertiser
 import java.net.Inet4Address
@@ -43,6 +45,7 @@ class BlueHopCompanionService : CompanionDeviceService() {
     private lateinit var bluetoothController: Api37BluetoothController
     private lateinit var selectedDeviceRepository: SelectedDeviceRepository
     private lateinit var pskStore: KeystorePskStore
+    private lateinit var pairedPeersRepository: PairedPeersRepository
     private lateinit var holderServer: HolderHttpServer
     private lateinit var nsdAdvertiser: NsdAdvertiser
 
@@ -59,6 +62,7 @@ class BlueHopCompanionService : CompanionDeviceService() {
         bluetoothController = Api37BluetoothController(appContext)
         selectedDeviceRepository = SelectedDeviceRepository.from(appContext)
         pskStore = KeystorePskStore.from(appContext)
+        pairedPeersRepository = PairedPeersRepository.from(appContext)
         nsdAdvertiser = NsdAdvertiser(appContext)
         holderServer = HolderHttpServer(
             deviceStates = stateObserver.deviceStates,
@@ -66,6 +70,12 @@ class BlueHopCompanionService : CompanionDeviceService() {
             isDeviceConnected = { address -> isDeviceCurrentlyConnected(address) },
             bluetoothController = bluetoothController,
             pskStore = pskStore,
+            peerPskResolver = { requesterId ->
+                pairedPeersRepository.getPeerPsk(requesterId)
+                    ?: if (BuildConfig.DEBUG) pskStore.getOrCreatePsk() else null
+            },
+            holderIdProvider = { pairedPeersRepository.getOrCreateIdentity().deviceId },
+            holderNameProvider = { pairedPeersRepository.getOrCreateIdentity().deviceName },
             onLog = { message -> Log.i(TAG, message) },
         )
 
@@ -138,11 +148,21 @@ class BlueHopCompanionService : CompanionDeviceService() {
     private suspend fun ensureHolderActive(deviceAddress: String?) {
         lifecycleMutex.withLock {
             if (holderActive) return
+            val identity = pairedPeersRepository.getOrCreateIdentity()
             val port = holderServer.start()
-            nsdAdvertiser.start(port = port, deviceAddress = deviceAddress)
+            nsdAdvertiser.start(
+                port = port,
+                deviceAddress = deviceAddress,
+                deviceId = identity.deviceId,
+                deviceName = identity.deviceName,
+                pairing = false,
+            )
             holderActive = true
             val ips = localIpv4Addresses().joinToString().ifEmpty { "none" }
-            Log.i(TAG, "Holder active on port=$port ips=[$ips] device=${deviceAddress ?: "any"}")
+            Log.i(
+                TAG,
+                "Holder active on port=$port ips=[$ips] id=${identity.deviceId} device=${deviceAddress ?: "any"}",
+            )
         }
     }
 

@@ -7,7 +7,8 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.util.Log
-import java.util.concurrent.Executors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
 
 private const val TAG = "BlueHopNsd"
 
@@ -17,7 +18,7 @@ class NsdAdvertiser(
     private val appContext = context.applicationContext
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val wifiManager = appContext.getSystemService(WifiManager::class.java)
-    private val callbackExecutor = Executors.newSingleThreadExecutor()
+    private val callbackExecutor = Dispatchers.IO.asExecutor()
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
@@ -25,7 +26,10 @@ class NsdAdvertiser(
     @Synchronized
     fun start(
         port: Int,
-        deviceAddress: String?,
+        deviceAddress: String? = null,
+        deviceId: String? = null,
+        deviceName: String? = null,
+        pairing: Boolean = false,
     ) {
         if (port <= 0) return
         stop()
@@ -45,13 +49,23 @@ class NsdAdvertiser(
 
         acquireMulticastLock()
 
+        val resolvedServiceName = buildServiceName(deviceName, pairing)
         val serviceInfo = NsdServiceInfo().apply {
-            serviceName = SERVICE_NAME
+            serviceName = resolvedServiceName
             serviceType = SERVICE_TYPE
             setPort(port)
             setAttribute("v", "1")
+            if (!deviceId.isNullOrBlank()) {
+                setAttribute("id", deviceId)
+            }
+            if (!deviceName.isNullOrBlank()) {
+                setAttribute("name", deviceName)
+            }
             if (!deviceAddress.isNullOrBlank()) {
                 setAttribute("device", deviceAddress)
+            }
+            if (pairing) {
+                setAttribute("pair", "1")
             }
         }
 
@@ -103,7 +117,6 @@ class NsdAdvertiser(
     @Synchronized
     fun shutdown() {
         stop()
-        callbackExecutor.shutdownNow()
     }
 
     private fun acquireMulticastLock() {
@@ -136,5 +149,16 @@ class NsdAdvertiser(
         const val SERVICE_NAME = "BlueHop"
         const val SERVICE_TYPE = "_bluehop._tcp."
         private const val MULTICAST_LOCK_TAG = "bluehop:mdns"
+        private const val MAX_SERVICE_NAME_LENGTH = 50
+
+        internal fun buildServiceName(deviceName: String?, pairing: Boolean): String {
+            val base = if (!deviceName.isNullOrBlank()) {
+                "$SERVICE_NAME - ${deviceName.trim()}"
+            } else {
+                SERVICE_NAME
+            }
+            val full = if (pairing) "$base (pair)" else base
+            return full.take(MAX_SERVICE_NAME_LENGTH)
+        }
     }
 }
