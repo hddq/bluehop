@@ -29,6 +29,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Test
 import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -514,15 +515,25 @@ class HolderHttpServerTest {
             server.stop()
         }
     }
+}
 
-    private fun isIpv6DualStackSupported(): Boolean {
-        if (System.getProperty("java.net.preferIPv4Stack")?.toBoolean() == true) {
-            return false
-        }
-        return runCatching {
-            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::", 0)) }
-            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::1", 0)) }
-            true
-        }.getOrDefault(false)
+internal fun isIpv6DualStackSupported(): Boolean {
+    if (System.getProperty("java.net.preferIPv4Stack")?.toBoolean() == true) {
+        return false
     }
+    return runCatching {
+        ServerSocketChannel.open().use { listener ->
+            listener.bind(InetSocketAddress("::", 0))
+            val serverSocket = listener.socket()
+            serverSocket.soTimeout = 1_000
+            val port = serverSocket.localPort
+            for (loopback in listOf("::1", "127.0.0.1")) {
+                Socket().use { client ->
+                    client.connect(InetSocketAddress(loopback, port), 1_000)
+                    serverSocket.accept().use { }
+                }
+            }
+        }
+        true
+    }.getOrDefault(false)
 }

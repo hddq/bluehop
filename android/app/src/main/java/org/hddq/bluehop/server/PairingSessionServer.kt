@@ -112,8 +112,8 @@ class PairingSessionServer(
 
     private fun startEngine(
         bindHost: String,
-    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> =
-        embeddedServer(
+    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
+        val candidate = embeddedServer(
             factory = CIO,
             port = preferredPort,
             host = bindHost,
@@ -126,7 +126,14 @@ class PairingSessionServer(
                     handlePair(call)
                 }
             }
-        }.start(wait = false)
+        }
+        return try {
+            candidate.start(wait = false)
+        } catch (error: Throwable) {
+            runCatching { candidate.stop(gracePeriodMillis = 0L, timeoutMillis = 0L) }
+            throw error
+        }
+    }
 
     suspend fun regenerateSession() {
         sessionMutex.withLock {

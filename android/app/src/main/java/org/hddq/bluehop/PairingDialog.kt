@@ -882,7 +882,7 @@ internal fun resolveLocalIpAddresses(context: Context): List<String> {
             val flags = linkAddress.flags
             if ((flags and invalidFlags) != 0) {
                 excludedLinkAddresses += address
-            } else if ((flags and OsConstants.IFA_F_TEMPORARY) != 0) {
+            } else if (address is Inet6Address && (flags and OsConstants.IFA_F_TEMPORARY) != 0) {
                 excludedLinkAddresses += address
                 temporaryFallback += address
             } else {

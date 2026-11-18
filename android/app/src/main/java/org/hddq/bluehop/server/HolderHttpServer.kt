@@ -144,8 +144,8 @@ class HolderHttpServer(
     private fun startEngine(
         bindHost: String,
         port: Int,
-    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> =
-        embeddedServer(
+    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
+        val candidate = embeddedServer(
             factory = CIO,
             port = port,
             host = bindHost,
@@ -194,7 +194,14 @@ class HolderHttpServer(
                     }
                 }
             }
-        }.start(wait = false)
+        }
+        return try {
+            candidate.start(wait = false)
+        } catch (error: Throwable) {
+            runCatching { candidate.stop(gracePeriodMillis = 0L, timeoutMillis = 0L) }
+            throw error
+        }
+    }
 
     private suspend fun handleRelease(call: io.ktor.server.routing.RoutingCall) {
         val body = call.receiveText()

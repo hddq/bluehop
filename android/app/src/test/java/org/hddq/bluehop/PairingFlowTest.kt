@@ -29,9 +29,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Test
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.ServerSocket
-import java.nio.channels.ServerSocketChannel
 import kotlin.concurrent.thread
 
 class PairingFlowTest {
@@ -615,16 +613,5 @@ class PairingFlowTest {
         } finally {
             pairingServer.stop()
         }
-    }
-
-    private fun isIpv6DualStackSupported(): Boolean {
-        if (System.getProperty("java.net.preferIPv4Stack")?.toBoolean() == true) {
-            return false
-        }
-        return runCatching {
-            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::", 0)) }
-            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::1", 0)) }
-            true
-        }.getOrDefault(false)
     }
 }
