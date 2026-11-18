@@ -36,6 +36,8 @@ import org.hddq.bluehop.protocol.ProtocolVerifier
 import org.hddq.bluehop.protocol.PskStore
 import org.hddq.bluehop.protocol.VerificationResult
 import java.net.BindException
+import java.net.SocketException
+import java.nio.channels.UnsupportedAddressTypeException
 import java.util.Locale
 
 @Serializable
@@ -95,18 +97,35 @@ class HolderHttpServer(
     suspend fun start(): Int {
         server?.let { return boundPort }
 
-        val started = try {
-            startEngine(preferredPort)
+        val (started, boundHost) = startWithFallback()
+        server = started
+        boundPort = started.engine.resolvedConnectors().first().port
+        onLog("Holder HTTP server listening on ${PairingClient.formatHostPort(boundHost, boundPort)}")
+        return boundPort
+    }
+
+    private fun startWithFallback(): Pair<EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>, String> =
+        try {
+            startEngineWithPortFallback(host) to host
+        } catch (error: Throwable) {
+            if (host == DEFAULT_HOST && isIpv6UnavailableError(error)) {
+                onLog("Dual-stack IPv6 unavailable on $host, falling back to $IPV4_FALLBACK_HOST")
+                startEngineWithPortFallback(IPV4_FALLBACK_HOST) to IPV4_FALLBACK_HOST
+            } else {
+                throw error
+            }
+        }
+
+    private fun startEngineWithPortFallback(
+        bindHost: String,
+    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> =
+        try {
+            startEngine(bindHost, preferredPort)
         } catch (error: BindException) {
             if (preferredPort == 0) throw error
             onLog("Port $preferredPort unavailable, falling back to ephemeral port")
-            startEngine(0)
+            startEngine(bindHost, 0)
         }
-        server = started
-        boundPort = started.engine.resolvedConnectors().first().port
-        onLog("Holder HTTP server listening on $host:$boundPort")
-        return boundPort
-    }
 
     suspend fun awaitIdle(timeoutMs: Long = 3_000L) {
         withTimeoutOrNull(timeoutMs) {
@@ -123,12 +142,13 @@ class HolderHttpServer(
     }
 
     private fun startEngine(
+        bindHost: String,
         port: Int,
     ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> =
         embeddedServer(
             factory = CIO,
             port = port,
-            host = host,
+            host = bindHost,
         ) {
             routing {
                 get("/status") {
@@ -404,7 +424,8 @@ class HolderHttpServer(
     }?.value
 
     companion object {
-        const val DEFAULT_HOST = "0.0.0.0"
+        const val DEFAULT_HOST = "::"
+        const val IPV4_FALLBACK_HOST = "0.0.0.0"
         const val DEFAULT_PORT = 8765
         const val DEFAULT_DISCONNECT_RETRY_DELAY_MS = 4_000L
         const val DEFAULT_DISCONNECT_TIMEOUT_MS = 10_000L
@@ -412,3 +433,11 @@ class HolderHttpServer(
         private const val UNKNOWN_DEVICE_ADDRESS = "00:00:00:00:00:00"
     }
 }
+
+internal fun isIpv6UnavailableError(error: Throwable): Boolean =
+    generateSequence(error) { it.cause }.any { cause ->
+        cause is UnsupportedAddressTypeException ||
+            (cause is SocketException && cause !is BindException) ||
+            (cause is BindException &&
+                cause.message?.contains("assign requested address", ignoreCase = true) == true)
+    }

@@ -18,6 +18,9 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.URI
 import java.util.concurrent.TimeUnit
@@ -226,7 +229,8 @@ class PairingClient(
         const val MAX_RESPONSE_BYTES = 64 * 1024
 
         internal fun formatHostPort(host: String, port: Int): String {
-            val bracketedHost = if (':' in host && !host.startsWith("[")) "[$host]" else host
+            val trimmed = host.trim()
+            val bracketedHost = if (':' in trimmed && !trimmed.startsWith("[")) "[$trimmed]" else trimmed
             return "$bracketedHost:$port"
         }
 
@@ -300,3 +304,56 @@ private fun parseManualPairingPort(rawPort: String): Int {
     require(port in 1..65535) { "Port must be between 1 and 65535" }
     return port
 }
+
+internal fun isUniqueLocalIpv6(address: Inet6Address): Boolean {
+    val bytes = address.address
+    return bytes.size == 16 && (bytes[0].toInt() and 0xFE) == 0xFC
+}
+
+internal fun isGlobalUnicastIpv6(address: Inet6Address): Boolean {
+    val bytes = address.address
+    if (bytes.size != 16) return false
+    if ((bytes[0].toInt() and 0xE0) != 0x20) return false
+    val isTeredo = bytes[0].toInt() == 0x20 &&
+        bytes[1].toInt() == 0x01 &&
+        bytes[2].toInt() == 0x00 &&
+        bytes[3].toInt() == 0x00
+    return !isTeredo
+}
+
+internal fun isUsableLocalIpAddress(address: InetAddress): Boolean {
+    if (address.isLoopbackAddress ||
+        address.isAnyLocalAddress ||
+        address.isLinkLocalAddress ||
+        address.isMulticastAddress
+    ) {
+        return false
+    }
+    return when (address) {
+        is Inet4Address -> true
+        is Inet6Address -> {
+            if (address.isSiteLocalAddress || address.scopeId != 0 || address.scopedInterface != null) {
+                return false
+            }
+            val host = address.hostAddress ?: return false
+            if ('%' in host) return false
+            isUniqueLocalIpv6(address) || isGlobalUnicastIpv6(address)
+        }
+        else -> false
+    }
+}
+
+internal fun filterAndSortLocalIpAddresses(
+    addresses: Iterable<InetAddress>,
+    excludedAddresses: Set<InetAddress> = emptySet(),
+): List<String> = addresses
+    .filter { it !in excludedAddresses && isUsableLocalIpAddress(it) }
+    .sortedBy { address ->
+        when {
+            address is Inet4Address -> 0
+            address is Inet6Address && isUniqueLocalIpv6(address) -> 1
+            else -> 2
+        }
+    }
+    .mapNotNull { it.hostAddress }
+    .distinct()

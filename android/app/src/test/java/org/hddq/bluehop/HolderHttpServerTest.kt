@@ -19,16 +19,21 @@ import org.hddq.bluehop.protocol.ProtocolVerifier
 import org.hddq.bluehop.protocol.PskStore
 import org.hddq.bluehop.protocol.VerificationFailureReason
 import org.hddq.bluehop.protocol.VerificationResult
+import org.hddq.bluehop.server.GrabClient
 import org.hddq.bluehop.server.HolderHttpServer
 import org.hddq.bluehop.server.HolderStatusResponse
+import org.hddq.bluehop.server.ReleaseOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
+import java.net.InetSocketAddress
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.channels.ServerSocketChannel
 import java.time.Duration
 
 class HolderHttpServerTest {
@@ -451,5 +456,73 @@ class HolderHttpServerTest {
             .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
             .build()
         return client.send(request, HttpResponse.BodyHandlers.ofString())
+    }
+
+    @Test
+    fun `default dual-stack server accepts status and release over ipv4 and ipv6`() = runBlocking {
+        assertEquals("::", HolderHttpServer.DEFAULT_HOST)
+        Assume.assumeTrue("IPv6 is disabled in this test environment", isIpv6DualStackSupported())
+
+        val deviceStates = MutableStateFlow(
+            mapOf(testAddress to DeviceState(bredrConnected = true)),
+        )
+        val controller = FakeBluetoothController(
+            onDisconnect = { addr ->
+                deviceStates.value = mapOf(addr to DeviceState(bredrConnected = false))
+            },
+        )
+        val verifier = ProtocolVerifier(nowEpochSeconds = { fixedNow })
+        val server = HolderHttpServer(
+            preferredPort = 0,
+            deviceStates = deviceStates,
+            selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", testAddress) },
+            isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+            bluetoothController = controller,
+            pskStore = InMemoryPskStore(testPsk),
+            verifier = verifier,
+            nowEpochSeconds = { fixedNow },
+            pollIntervalMs = 20L,
+        )
+
+        val port = server.start()
+        try {
+            val grabClient = GrabClient(
+                verifier = verifier,
+                nowEpochSeconds = { fixedNow },
+            )
+            val ipv4Status = grabClient.fetchStatus("127.0.0.1", port).getOrThrow()
+            assertEquals(port, ipv4Status.port)
+            assertTrue(ipv4Status.connected)
+
+            val ipv6Status = grabClient.fetchStatus("::1", port).getOrThrow()
+            assertEquals(port, ipv6Status.port)
+            assertTrue(ipv6Status.connected)
+
+            val bracketedStatus = grabClient.fetchStatus("[::1]", port).getOrThrow()
+            assertEquals(port, bracketedStatus.port)
+
+            val releaseOutcome = grabClient.requestRelease(
+                host = "::1",
+                port = port,
+                deviceAddress = testAddress,
+                requesterId = "pc-linux",
+                psk = testPsk,
+            )
+            assertTrue("Expected release over ::1 to succeed, got $releaseOutcome", releaseOutcome is ReleaseOutcome.Released)
+            assertEquals(listOf(testAddress), controller.disconnectCalls)
+        } finally {
+            server.stop()
+        }
+    }
+
+    private fun isIpv6DualStackSupported(): Boolean {
+        if (System.getProperty("java.net.preferIPv4Stack")?.toBoolean() == true) {
+            return false
+        }
+        return runCatching {
+            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::", 0)) }
+            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::1", 0)) }
+            true
+        }.getOrDefault(false)
     }
 }

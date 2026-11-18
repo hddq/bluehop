@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -32,7 +33,8 @@ data class DiscoveredBlueHopPeer(
         ?: emptySet(),
 ) {
     val stableKey: String
-        get() = deviceId?.takeIf { it.isNotBlank() } ?: "$serviceName@$host:$port"
+        get() = deviceId?.takeIf { it.isNotBlank() }
+            ?: "$serviceName@${PairingClient.formatHostPort(host, port)}"
 }
 
 class NsdPeerDiscovery(
@@ -243,9 +245,23 @@ class NsdPeerDiscovery(
         }
 
         internal fun selectPreferredHost(addresses: List<InetAddress>): String? {
-            val ipv4 = addresses.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
+            val ipv4 = addresses.firstOrNull {
+                it is Inet4Address && isUsableLocalIpAddress(it)
+            }
             if (ipv4 != null) return ipv4.hostAddress
+
+            val ulaIpv6 = addresses.firstOrNull {
+                it is Inet6Address && isUsableLocalIpAddress(it) && isUniqueLocalIpv6(it)
+            }
+            if (ulaIpv6 != null) return ulaIpv6.hostAddress
+
+            val usableIpv6 = addresses.firstOrNull {
+                it is Inet6Address && isUsableLocalIpAddress(it)
+            }
+            if (usableIpv6 != null) return usableIpv6.hostAddress
+
             return addresses.firstOrNull { !it.isLoopbackAddress && !it.isLinkLocalAddress }?.hostAddress
+                ?: addresses.firstOrNull { !it.isLoopbackAddress }?.hostAddress
                 ?: addresses.firstOrNull()?.hostAddress
         }
     }

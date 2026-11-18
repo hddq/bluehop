@@ -1,21 +1,37 @@
 package org.hddq.bluehop
 
+import android.bluetooth.BluetoothStatusCodes
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
+import org.hddq.bluehop.bluetooth.BluetoothControlResult
+import org.hddq.bluehop.bluetooth.BluetoothController
+import org.hddq.bluehop.bluetooth.DeviceState
+import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
+import org.hddq.bluehop.protocol.ProtocolVerifier
+import org.hddq.bluehop.protocol.PskStore
+import org.hddq.bluehop.server.GrabClient
+import org.hddq.bluehop.server.HolderHttpServer
 import org.hddq.bluehop.server.ManualPairingTarget
+import org.hddq.bluehop.server.NsdPeerDiscovery
 import org.hddq.bluehop.server.PairingClient
 import org.hddq.bluehop.server.PairingSessionServer
 import org.hddq.bluehop.server.PairingSessionState
+import org.hddq.bluehop.server.ReleaseOutcome
+import org.hddq.bluehop.server.filterAndSortLocalIpAddresses
 import org.hddq.bluehop.server.parseManualPairingAddress
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.nio.channels.ServerSocketChannel
 import kotlin.concurrent.thread
 
 class PairingFlowTest {
@@ -424,5 +440,191 @@ class PairingFlowTest {
         assertEquals("laptop.local:8765", PairingClient.formatHostPort("laptop.local", 8765))
         assertEquals("[::1]:8765", PairingClient.formatHostPort("::1", 8765))
         assertEquals("[2001:db8::1]:43215", PairingClient.formatHostPort("[2001:db8::1]", 43215))
+        assertEquals(
+            "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:8765",
+            PairingClient.formatHostPort("2001:0db8:85a3:0000:0000:8a2e:0370:7334", 8765),
+        )
+    }
+
+    @Test
+    fun formatBaseUrlAndManualAddressSupportIpv4AndFullIpv6() {
+        val grabClient = GrabClient()
+        val pairingClient = PairingClient()
+
+        assertEquals("http://192.168.1.42:8765", grabClient.formatBaseUrl("192.168.1.42", 8765))
+        assertEquals("http://[::1]:8765", grabClient.formatBaseUrl("::1", 8765))
+        assertEquals("http://[::1]:8765", grabClient.formatBaseUrl("[::1]", 8765))
+        assertEquals(
+            "http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:8765",
+            grabClient.formatBaseUrl("2001:0db8:85a3:0000:0000:8a2e:0370:7334", 8765),
+        )
+        assertEquals(
+            "http://[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:8765",
+            pairingClient.formatBaseUrl("[2001:0db8:85a3:0000:0000:8a2e:0370:7334]", 8765),
+        )
+
+        assertEquals(
+            ManualPairingTarget("2001:0db8:85a3:0000:0000:8a2e:0370:7334", 43215),
+            parseManualPairingAddress("[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:43215").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("::1", 8765),
+            parseManualPairingAddress("http://[::1]:8765/").getOrThrow(),
+        )
+    }
+
+    @Test
+    fun selectPreferredHostAndFilterLocalIpsSupportIpv4AndRoutableIpv6() {
+        val ipv4Lan = InetAddress.getByName("192.168.1.25")
+        val ipv4LinkLocal = InetAddress.getByName("169.254.10.20")
+        val ipv4Loopback = InetAddress.getByName("127.0.0.1")
+        val ipv6Loopback = InetAddress.getByName("::1")
+        val ipv6LinkLocal = InetAddress.getByName("fe80::1")
+        val ipv6SiteLocal = InetAddress.getByName("fec0::1")
+        val ipv6Multicast = InetAddress.getByName("ff02::1")
+        val ipv6Teredo = InetAddress.getByName("2001:0000::1")
+        val ipv6Ula = InetAddress.getByName("fd12:3456:789a::1")
+        val ipv6Global = InetAddress.getByName("2001:0db8:85a3:0000:0000:8a2e:0370:7334")
+        val ipv6Temp = InetAddress.getByName("2001:0db8:85a3::9999")
+
+        assertEquals(
+            ipv4Lan.hostAddress,
+            NsdPeerDiscovery.selectPreferredHost(listOf(ipv6Loopback, ipv6Global, ipv4Lan)),
+        )
+        assertEquals(
+            ipv6Ula.hostAddress,
+            NsdPeerDiscovery.selectPreferredHost(listOf(ipv4Loopback, ipv4LinkLocal, ipv6LinkLocal, ipv6Global, ipv6Ula)),
+        )
+        assertEquals(
+            ipv6Global.hostAddress,
+            NsdPeerDiscovery.selectPreferredHost(listOf(ipv6Loopback, ipv6LinkLocal, ipv6Global)),
+        )
+
+        val filtered = filterAndSortLocalIpAddresses(
+            addresses = listOf(
+                ipv6Global,
+                ipv6Temp,
+                ipv6Loopback,
+                ipv6LinkLocal,
+                ipv6SiteLocal,
+                ipv6Multicast,
+                ipv6Teredo,
+                ipv4LinkLocal,
+                ipv4Loopback,
+                ipv6Ula,
+                ipv4Lan,
+            ),
+            excludedAddresses = setOf(ipv6Temp),
+        )
+        assertEquals(
+            listOf(ipv4Lan.hostAddress, ipv6Ula.hostAddress, ipv6Global.hostAddress),
+            filtered,
+        )
+    }
+
+    @Test
+    fun pairingSessionServerDefaultDualStackPairsAndReleasesOverIpv6AndIpv4() = runBlocking {
+        Assume.assumeTrue("IPv6 is disabled in this test environment", isIpv6DualStackSupported())
+
+        var pairedOverIpv6: PairedPeer? = null
+        val pairingServer = PairingSessionServer(
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = { peer -> pairedOverIpv6 = peer },
+            nowEpochSeconds = { 1_760_000_000L },
+        )
+
+        val pairingPort = pairingServer.start()
+        try {
+            val waiting = pairingServer.state.value as PairingSessionState.WaitingForPeer
+            val manualTarget = parseManualPairingAddress("[::1]:$pairingPort").getOrThrow()
+            val pairingClient = PairingClient(nowEpochSeconds = { 1_760_000_005L })
+            val pairResult = pairingClient.pairWithHost(
+                host = manualTarget.host,
+                port = manualTarget.port,
+                pin = waiting.pin,
+                localIdentity = requesterIdentity,
+            )
+            assertTrue("Pairing over ::1 should succeed: ${pairResult.exceptionOrNull()}", pairResult.isSuccess)
+            val requesterPeer = pairResult.getOrThrow()
+            val responderPeer = pairedOverIpv6!!
+            assertArrayEquals(responderPeer.psk, requesterPeer.psk)
+
+            // Also verify dual-stack PairingSessionServer accepts IPv4 127.0.0.1 after regenerating session
+            pairingServer.regenerateSession()
+            val refreshed = pairingServer.state.value as PairingSessionState.WaitingForPeer
+            val ipv4PairResult = pairingClient.pairWithHost(
+                host = "127.0.0.1",
+                port = pairingPort,
+                pin = refreshed.pin,
+                localIdentity = requesterIdentity,
+            )
+            assertTrue("Pairing over 127.0.0.1 on :: server should succeed", ipv4PairResult.isSuccess)
+
+            // Follow up with an actual HolderHttpServer release request over ::1 using the paired PSK
+            val headphoneMac = "AC:80:0A:CD:82:A1"
+            val deviceStates = MutableStateFlow(
+                mapOf(headphoneMac to DeviceState(bredrConnected = true)),
+            )
+            val disconnectCalls = mutableListOf<String>()
+            val holderServer = HolderHttpServer(
+                preferredPort = 0,
+                deviceStates = deviceStates,
+                selectedDeviceProvider = { SelectedBluetoothDevice("WH-1000XM4", headphoneMac) },
+                isDeviceConnected = { addr -> deviceStates.value[addr]?.isConnected == true },
+                bluetoothController = object : BluetoothController {
+                    override fun connect(address: String) =
+                        BluetoothControlResult(BluetoothStatusCodes.SUCCESS, "OK")
+
+                    override fun disconnect(address: String): BluetoothControlResult {
+                        disconnectCalls += address
+                        deviceStates.value = mapOf(address to DeviceState(bredrConnected = false))
+                        return BluetoothControlResult(BluetoothStatusCodes.SUCCESS, "OK")
+                    }
+                },
+                pskStore = object : PskStore {
+                    override suspend fun getOrCreatePsk(): ByteArray = ByteArray(32)
+                    override suspend fun setPsk(psk: ByteArray) = Unit
+                    override suspend fun clearPsk() = Unit
+                },
+                peerPskResolver = { requesterId ->
+                    if (requesterId == requesterIdentity.deviceId) responderPeer.psk else null
+                },
+                verifier = ProtocolVerifier(nowEpochSeconds = { 1_760_000_010L }),
+                nowEpochSeconds = { 1_760_000_010L },
+                pollIntervalMs = 20L,
+            )
+            val holderPort = holderServer.start()
+            try {
+                val grabClient = GrabClient(
+                    verifier = ProtocolVerifier(nowEpochSeconds = { 1_760_000_010L }),
+                    nowEpochSeconds = { 1_760_000_010L },
+                )
+                val releaseOutcome = grabClient.requestRelease(
+                    host = "::1",
+                    port = holderPort,
+                    deviceAddress = headphoneMac,
+                    requesterId = requesterIdentity.deviceId,
+                    psk = requesterPeer.psk,
+                )
+                assertTrue("Expected ReleaseOutcome.Released over ::1, got $releaseOutcome", releaseOutcome is ReleaseOutcome.Released)
+                assertEquals(listOf(headphoneMac), disconnectCalls)
+            } finally {
+                holderServer.stop()
+            }
+        } finally {
+            pairingServer.stop()
+        }
+    }
+
+    private fun isIpv6DualStackSupported(): Boolean {
+        if (System.getProperty("java.net.preferIPv4Stack")?.toBoolean() == true) {
+            return false
+        }
+        return runCatching {
+            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::", 0)) }
+            ServerSocketChannel.open().use { it.bind(InetSocketAddress("::1", 0)) }
+            true
+        }.getOrDefault(false)
     }
 }
