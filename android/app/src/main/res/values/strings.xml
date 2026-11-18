@@ -61,4 +61,7 @@
     <string name="hop_status_connected_unconfirmed">Connected, audio profile confirmation timed out</string>
     <string name="hop_status_already_connected">Already connected</string>
     <string name="hop_status_needs_association">Allow device access in the system prompt, then try again</string>
+
+    <string name="about_section_title">About</string>
+    <string name="about_version_title">Version</string>
 </resources>
