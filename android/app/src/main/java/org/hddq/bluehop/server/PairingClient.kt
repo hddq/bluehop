@@ -1,6 +1,11 @@
 package org.hddq.bluehop.server
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PROTOCOL_VERSION
@@ -10,14 +15,18 @@ import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
 import org.hddq.bluehop.protocol.ProtocolJson
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URI
+import java.util.concurrent.TimeUnit
 
 class PairingClient(
     private val nowEpochSeconds: () -> Long = { System.currentTimeMillis() / 1_000L },
     private val connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS,
+    private val totalTimeoutMs: Int = DEFAULT_TOTAL_TIMEOUT_MS,
 ) {
     suspend fun pairWithHost(
         host: String,
@@ -25,12 +34,15 @@ class PairingClient(
         pin: String,
         localIdentity: LocalDeviceIdentity,
     ): Result<PairedPeer> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
+            require(totalTimeoutMs > 0) { "Total timeout must be positive" }
+            val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(totalTimeoutMs.toLong())
+
             val normalizedPin = PairingCrypto.normalizePin(pin)
             require(normalizedPin.length == 6) { "Enter the 6-digit pairing code" }
 
             val baseUrl = formatBaseUrl(host, port)
-            val infoHttpResponse = get("$baseUrl/pair/info")
+            val infoHttpResponse = get("$baseUrl/pair/info", deadlineNanos)
             if (infoHttpResponse.statusCode !in 200..299) {
                 val errMsg = runCatching {
                     ProtocolJson.decodePairResponse(infoHttpResponse.body).message
@@ -79,6 +91,7 @@ class PairingClient(
             val pairHttpResponse = postJson(
                 url = "$baseUrl/pair",
                 jsonBody = ProtocolJson.encodePairRequest(pairRequest),
+                deadlineNanos = deadlineNanos,
             )
 
             val pairResponse = ProtocolJson.decodePairResponse(pairHttpResponse.body)
@@ -97,29 +110,38 @@ class PairingClient(
             )
             check(serverProofValid) { "Host proof verification failed" }
 
-            PairedPeer(
-                peerId = info.responderId,
-                peerName = pairResponse.responderName.ifBlank { info.responderName },
-                psk = derivedPsk,
-                pairedAtEpochSec = nowEpochSeconds(),
+            Result.success(
+                PairedPeer(
+                    peerId = info.responderId,
+                    peerName = pairResponse.responderName.ifBlank { info.responderName },
+                    psk = derivedPsk,
+                    pairedAtEpochSec = nowEpochSeconds(),
+                ),
             )
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Throwable) {
+            Result.failure(error)
         }
     }
 
-    private fun get(url: String): SimpleHttpResponse = execute(url = url, method = "GET", jsonBody = null)
+    private suspend fun get(url: String, deadlineNanos: Long): SimpleHttpResponse =
+        execute(url = url, method = "GET", jsonBody = null, deadlineNanos = deadlineNanos)
 
-    private fun postJson(url: String, jsonBody: String): SimpleHttpResponse =
-        execute(url = url, method = "POST", jsonBody = jsonBody)
+    private suspend fun postJson(url: String, jsonBody: String, deadlineNanos: Long): SimpleHttpResponse =
+        execute(url = url, method = "POST", jsonBody = jsonBody, deadlineNanos = deadlineNanos)
 
-    private fun execute(
+    private suspend fun execute(
         url: String,
         method: String,
         jsonBody: String?,
-    ): SimpleHttpResponse {
+        deadlineNanos: Long,
+    ): SimpleHttpResponse = coroutineScope {
+        val initialRemainingMs = remainingMillis(deadlineNanos)
         val connection = (URI.create(url).toURL().openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = connectTimeoutMs
-            readTimeout = readTimeoutMs
+            connectTimeout = minOf(connectTimeoutMs, initialRemainingMs)
+            readTimeout = minOf(readTimeoutMs, initialRemainingMs)
             useCaches = false
             setRequestProperty("Accept", "application/json")
             if (jsonBody != null) {
@@ -127,7 +149,16 @@ class PairingClient(
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
             }
         }
-        return try {
+        val cancelHandle = coroutineContext.job.invokeOnCompletion { cause ->
+            if (cause != null) {
+                runCatching { connection.disconnect() }
+            }
+        }
+        val watchdog = launch {
+            delay(initialRemainingMs.toLong())
+            runCatching { connection.disconnect() }
+        }
+        return@coroutineScope try {
             if (jsonBody != null) {
                 connection.outputStream.use { stream ->
                     stream.write(jsonBody.toByteArray(Charsets.UTF_8))
@@ -135,22 +166,44 @@ class PairingClient(
             }
             val code = connection.responseCode
             val stream = if (code in 200..399) connection.inputStream else connection.errorStream
-            val body = stream?.use { readBoundedUtf8(it) }.orEmpty()
+            val body = stream?.use { readBoundedUtf8(it, deadlineNanos = deadlineNanos) }.orEmpty()
             SimpleHttpResponse(statusCode = code, body = body)
+        } catch (error: IOException) {
+            if (System.nanoTime() >= deadlineNanos) {
+                throw SocketTimeoutException("Pairing request timed out").apply { initCause(error) }
+            }
+            throw error
         } finally {
-            connection.disconnect()
+            watchdog.cancel()
+            cancelHandle.dispose()
+            runCatching { connection.disconnect() }
         }
+    }
+
+    private fun remainingMillis(deadlineNanos: Long): Int {
+        val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime())
+        if (remainingMs <= 0L) {
+            throw SocketTimeoutException("Pairing request timed out")
+        }
+        return remainingMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
     private fun readBoundedUtf8(
         stream: InputStream,
+        deadlineNanos: Long,
         maxBytes: Int = MAX_RESPONSE_BYTES,
     ): String {
         val buffer = ByteArray(4096)
         val output = ByteArrayOutputStream()
         while (true) {
+            if (System.nanoTime() >= deadlineNanos) {
+                throw SocketTimeoutException("Pairing request timed out")
+            }
             val read = stream.read(buffer)
             if (read == -1) break
+            if (System.nanoTime() >= deadlineNanos) {
+                throw SocketTimeoutException("Pairing request timed out")
+            }
             if (output.size() + read > maxBytes) {
                 error("Pairing response exceeded $maxBytes bytes")
             }
@@ -169,6 +222,7 @@ class PairingClient(
     companion object {
         const val DEFAULT_CONNECT_TIMEOUT_MS = 4_000
         const val DEFAULT_READ_TIMEOUT_MS = 5_000
+        const val DEFAULT_TOTAL_TIMEOUT_MS = 15_000
         const val MAX_RESPONSE_BYTES = 64 * 1024
 
         internal fun formatHostPort(host: String, port: Int): String {

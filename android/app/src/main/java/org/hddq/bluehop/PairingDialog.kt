@@ -1,5 +1,7 @@
 package org.hddq.bluehop
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -27,6 +29,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
@@ -65,6 +69,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -358,18 +363,21 @@ fun PairingDialog(
                         isPairing = true
                         clientError = null
                         coroutineScope.launch {
-                            val result = pairingClient.pairWithHost(
-                                host = targetHost,
-                                port = targetPort,
-                                pin = pinInput,
-                                localIdentity = identity,
-                            )
-                            isPairing = false
-                            result.onSuccess { peer ->
-                                pairedPeersRepository.upsertPeer(peer)
-                                clientPairedName = peer.peerName
-                            }.onFailure { error ->
-                                clientError = error.message ?: "Pairing failed"
+                            try {
+                                val result = pairingClient.pairWithHost(
+                                    host = targetHost,
+                                    port = targetPort,
+                                    pin = pinInput,
+                                    localIdentity = identity,
+                                )
+                                result.onSuccess { peer ->
+                                    pairedPeersRepository.upsertPeer(peer)
+                                    clientPairedName = peer.peerName
+                                }.onFailure { error ->
+                                    clientError = error.message ?: "Pairing failed"
+                                }
+                            } finally {
+                                isPairing = false
                             }
                         }
                     },
@@ -463,19 +471,94 @@ private fun ShowCodeContent(
                     val endpoints = localAddresses.map { host ->
                         PairingClient.formatHostPort(host, sessionState.port)
                     }
-                    val addressText = if (endpoints.isNotEmpty()) {
-                        stringResource(R.string.pairing_show_address, endpoints.joinToString(", "))
+                    if (endpoints.isNotEmpty()) {
+                        val context = LocalContext.current
+                        val clipboardManager = remember(context) {
+                            context.getSystemService(ClipboardManager::class.java)
+                        }
+                        var copiedEndpoint by remember { mutableStateOf<String?>(null) }
+                        LaunchedEffect(copiedEndpoint) {
+                            if (copiedEndpoint != null) {
+                                delay(2_000)
+                                copiedEndpoint = null
+                            }
+                        }
+                        val addressLabel = stringResource(R.string.pairing_show_addresses_label)
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = addressLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            endpoints.forEach { endpoint ->
+                                val isCopied = copiedEndpoint == endpoint
+                                Surface(
+                                    shape = MaterialTheme.shapes.small,
+                                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(start = 12.dp, end = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        SelectionContainer(
+                                            modifier = Modifier.weight(1f),
+                                        ) {
+                                            Text(
+                                                text = endpoint,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    fontFamily = FontFamily.Monospace,
+                                                ),
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                clipboardManager?.setPrimaryClip(
+                                                    ClipData.newPlainText(
+                                                        addressLabel,
+                                                        endpoint,
+                                                    ),
+                                                )
+                                                copiedEndpoint = endpoint
+                                            },
+                                            shapes = IconButtonDefaults.shapes(),
+                                        ) {
+                                            Icon(
+                                                painter = painterResource(
+                                                    if (isCopied) R.drawable.ic_check else R.drawable.ic_content_copy,
+                                                ),
+                                                contentDescription = stringResource(
+                                                    R.string.pairing_action_copy_address,
+                                                    endpoint,
+                                                ),
+                                                tint = if (isCopied) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                },
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else {
-                        stringResource(R.string.pairing_show_port, sessionState.port)
-                    }
-                    SelectionContainer {
-                        Text(
-                            text = addressText,
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                fontFamily = FontFamily.Monospace,
-                            ),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        SelectionContainer {
+                            Text(
+                                text = stringResource(R.string.pairing_show_port, sessionState.port),
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                ),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
                 if (sessionState.attemptsRemaining < PairingSessionServer.DEFAULT_MAX_ATTEMPTS) {

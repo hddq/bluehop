@@ -37,7 +37,8 @@
     <string name="pairing_mode_enter_code">Enter code</string>
     <string name="pairing_show_waiting">On your other device, choose Enter code and type this PIN.</string>
     <string name="pairing_show_device_name">Advertising as %1$s</string>
-    <string name="pairing_show_address">Address: %1$s</string>
+    <string name="pairing_show_addresses_label">Address</string>
+    <string name="pairing_action_copy_address">Copy %1$s</string>
     <string name="pairing_show_port">Port: %1$d</string>
     <plurals name="pairing_show_attempts_left">
         <item quantity="one">%1$d attempt remaining</item>

@@ -367,6 +367,58 @@ class PairingFlowTest {
     }
 
     @Test
+    fun pairingClientEnforcesOverallRequestDeadline() = runBlocking {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { serverSocket ->
+            val serverThread = thread(isDaemon = true) {
+                runCatching {
+                    serverSocket.accept().use { clientSocket ->
+                        clientSocket.soTimeout = 2_000
+                        val reader = clientSocket.getInputStream().bufferedReader(Charsets.US_ASCII)
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                        }
+                        val out = clientSocket.getOutputStream()
+                        out.write(
+                            (
+                                "HTTP/1.1 200 OK\r\n" +
+                                    "Content-Type: application/json\r\n" +
+                                    "Content-Length: 100\r\n" +
+                                    "Connection: close\r\n\r\n"
+                                ).toByteArray(Charsets.US_ASCII),
+                        )
+                        out.flush()
+                        repeat(40) {
+                            Thread.sleep(50)
+                            out.write('{'.code)
+                            out.flush()
+                        }
+                    }
+                }
+            }
+            val startNanos = System.nanoTime()
+            val result = PairingClient(
+                connectTimeoutMs = 1_000,
+                readTimeoutMs = 2_000,
+                totalTimeoutMs = 250,
+            ).pairWithHost(
+                host = "127.0.0.1",
+                port = serverSocket.localPort,
+                pin = "123456",
+                localIdentity = requesterIdentity,
+            )
+            val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L
+            serverThread.join(2_000)
+            assertTrue("Expected timeout failure, got $result", result.isFailure)
+            assertTrue(
+                "Expected SocketTimeoutException, got ${result.exceptionOrNull()}",
+                result.exceptionOrNull() is java.net.SocketTimeoutException,
+            )
+            assertTrue("Expected deadline to abort quickly, took ${elapsedMs}ms", elapsedMs < 1_500L)
+        }
+    }
+
+    @Test
     fun formatHostPortFormatsIpv4HostnameAndIpv6() {
         assertEquals("192.168.1.42:43215", PairingClient.formatHostPort("192.168.1.42", 43215))
         assertEquals("laptop.local:8765", PairingClient.formatHostPort("laptop.local", 8765))
