@@ -442,6 +442,7 @@ fun MainScreen(
     onRefreshDevicesClick: () -> Unit,
     onOpenBluetoothSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
+    title: String = stringResource(R.string.app_name),
     deviceStates: Map<String, DeviceState> = emptyMap(),
     hopStatusByAddress: Map<String, HopUiStatus> = emptyMap(),
     pairedPeers: List<PairedPeerSummary> = emptyList(),
@@ -460,7 +461,7 @@ fun MainScreen(
             MediumFlexibleTopAppBar(
                 title = {
                     Text(
-                        text = stringResource(R.string.app_name),
+                        text = title,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )

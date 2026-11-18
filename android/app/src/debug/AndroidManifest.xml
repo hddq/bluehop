@@ -3,6 +3,13 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <application>
+        <activity
+            android:name=".debug.DemoActivity"
+            android:exported="true"
+            android:label="@string/demo_app_name"
+            android:theme="@style/Theme.BlueHop"
+            tools:ignore="ExportedActivity" />
+
         <receiver
             android:name=".debug.ProtocolSelfTestReceiver"
             android:exported="true"
