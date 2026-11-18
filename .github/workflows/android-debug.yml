@@ -3,7 +3,7 @@ name: Android Debug CI
 on:
   push:
     branches:
-      - "**"
+      - master
     paths:
       - "android/**"
       - ".github/workflows/android-debug.yml"
