@@ -325,6 +325,12 @@ class PairingFlowTest {
                 val serverThread = thread(isDaemon = true) {
                     runCatching {
                         serverSocket.accept().use { clientSocket ->
+                            clientSocket.soTimeout = 2_000
+                            val reader = clientSocket.getInputStream().bufferedReader(Charsets.US_ASCII)
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (line.isEmpty()) break
+                            }
                             val payloadSize = PairingClient.MAX_RESPONSE_BYTES + 1
                             val header = (
                                 "HTTP/1.1 $statusLine\r\n" +
@@ -336,6 +342,10 @@ class PairingFlowTest {
                             out.write(header)
                             out.write(ByteArray(payloadSize) { 'a'.code.toByte() })
                             out.flush()
+                            clientSocket.shutdownOutput()
+                            while (reader.read() != -1) {
+                                // Wait for client to close cleanly before closing server socket
+                            }
                         }
                     }
                 }
