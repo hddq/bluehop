@@ -4,9 +4,12 @@ import kotlinx.coroutines.runBlocking
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
+import org.hddq.bluehop.server.HolderHttpServer
+import org.hddq.bluehop.server.ManualPairingTarget
 import org.hddq.bluehop.server.PairingClient
 import org.hddq.bluehop.server.PairingSessionServer
 import org.hddq.bluehop.server.PairingSessionState
+import org.hddq.bluehop.server.parseManualPairingAddress
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -232,5 +235,92 @@ class PairingFlowTest {
         } finally {
             server.stop()
         }
+    }
+
+    @Test
+    fun parseManualPairingAddressParsesValidHostsAndPorts() {
+        assertEquals(
+            ManualPairingTarget("192.168.1.42", 43215),
+            parseManualPairingAddress("192.168.1.42:43215").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("192.168.1.42", HolderHttpServer.DEFAULT_PORT),
+            parseManualPairingAddress(" 192.168.1.42 ").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("laptop.local", 9000),
+            parseManualPairingAddress("http://laptop.local:9000/").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("::1", 8765),
+            parseManualPairingAddress("[::1]:8765").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("2001:db8::1", HolderHttpServer.DEFAULT_PORT),
+            parseManualPairingAddress("[2001:db8::1]").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("2001:db8::1", HolderHttpServer.DEFAULT_PORT),
+            parseManualPairingAddress("2001:db8::1").getOrThrow(),
+        )
+    }
+
+    @Test
+    fun parseManualPairingAddressRejectsInvalidInputs() {
+        val invalidInputs = listOf(
+            "",
+            "   ",
+            "https://192.168.1.42:8765",
+            "192.168.1.42:",
+            ":8765",
+            "192.168.1.42:0",
+            "192.168.1.42:65536",
+            "192.168.1.42:abc",
+            "192.168.1.42/pair",
+            "192.168.1.42?a=b",
+            "user@192.168.1.42",
+            "192.168.1.42 8765",
+            "[::1",
+            "[::1]extra",
+        )
+        for (input in invalidInputs) {
+            assertTrue("Expected '$input' to fail", parseManualPairingAddress(input).isFailure)
+        }
+    }
+
+    @Test
+    fun pairingWithManuallyEnteredAddressSucceeds() = runBlocking {
+        var responderPairedPeer: PairedPeer? = null
+        val server = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = { peer -> responderPairedPeer = peer },
+        )
+
+        val port = server.start()
+        try {
+            val waiting = server.state.value as PairingSessionState.WaitingForPeer
+            val target = parseManualPairingAddress("127.0.0.1:$port").getOrThrow()
+            val client = PairingClient()
+            val result = client.pairWithHost(
+                host = target.host,
+                port = target.port,
+                pin = waiting.pin,
+                localIdentity = requesterIdentity,
+            )
+            assertTrue("Pairing should succeed: ${result.exceptionOrNull()}", result.isSuccess)
+            assertArrayEquals(responderPairedPeer!!.psk, result.getOrThrow().psk)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun formatHostPortFormatsIpv4HostnameAndIpv6() {
+        assertEquals("192.168.1.42:43215", PairingClient.formatHostPort("192.168.1.42", 43215))
+        assertEquals("laptop.local:8765", PairingClient.formatHostPort("laptop.local", 8765))
+        assertEquals("[::1]:8765", PairingClient.formatHostPort("::1", 8765))
+        assertEquals("[2001:db8::1]:43215", PairingClient.formatHostPort("[2001:db8::1]", 43215))
     }
 }
