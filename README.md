@@ -10,17 +10,17 @@ BlueHop automates that handoff over your local Wi-Fi network:
 
 - **One-tap switching:** Tap a Bluetooth device in BlueHop on the host you want to use it with.
 - **Automatic release & connect:** BlueHop finds paired hosts on your LAN via mDNS, asks the host currently holding the device to disconnect it, and immediately connects locally.
-- **No cloud or accounts:** Hosts pair directly over Wi-Fi using a 6-digit PIN and authenticate release requests with per-peer HMAC-SHA256 keys.
+- **No cloud or accounts:** Hosts pair directly over Wi-Fi using ephemeral ECDH (P-256) with 6-digit SAS verification and mutual HMAC key confirmation, and authenticate release requests with per-peer HMAC-SHA256 keys.
 
 ## Supported Platforms
 
 | Platform | Status |
 | --- | --- |
 | Android | Supported (Android 17 / SDK 37+) |
-| Linux | Coming soon |
+| Linux | Pairing CLI (`linux/`), host daemon coming soon |
 | Windows / macOS / iOS / others | Pull requests welcome! |
 
-If you'd like to add support for another platform (Windows, macOS, iOS, etc.), feel free to open a pull request — the wire protocol is simple HTTP/JSON + HMAC-SHA256 over mDNS.
+If you'd like to add support for another platform (Windows, macOS, iOS, etc.), feel free to open a pull request — the [wire protocol](protocol/README.md) is simple HTTP/JSON + ECDH/HKDF + HMAC-SHA256 over mDNS.
 
 ### Android
 

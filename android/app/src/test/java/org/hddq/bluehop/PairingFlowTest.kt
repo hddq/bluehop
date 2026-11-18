@@ -1,15 +1,27 @@
 package org.hddq.bluehop
 
 import android.bluetooth.BluetoothStatusCodes
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.hddq.bluehop.bluetooth.BluetoothControlResult
 import org.hddq.bluehop.bluetooth.BluetoothController
 import org.hddq.bluehop.bluetooth.DeviceState
 import org.hddq.bluehop.bluetooth.SelectedBluetoothDevice
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
+import org.hddq.bluehop.protocol.PAIRING_PROTOCOL_VERSION
+import org.hddq.bluehop.protocol.PairConfirmRequest
+import org.hddq.bluehop.protocol.PairConfirmResponse
+import org.hddq.bluehop.protocol.PairSessionStatus
+import org.hddq.bluehop.protocol.PairStartRequest
+import org.hddq.bluehop.protocol.PairStartResponse
+import org.hddq.bluehop.protocol.PairStatusResponse
 import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
+import org.hddq.bluehop.protocol.ProtocolJson
 import org.hddq.bluehop.protocol.ProtocolVerifier
 import org.hddq.bluehop.protocol.PskStore
 import org.hddq.bluehop.server.GrabClient
@@ -25,11 +37,14 @@ import org.hddq.bluehop.server.parseManualPairingAddress
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Test
+import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.net.URI
 import kotlin.concurrent.thread
 
 class PairingFlowTest {
@@ -44,7 +59,7 @@ class PairingFlowTest {
     )
 
     @Test
-    fun pairingCryptoDerivesSymmetricPskAndValidatesProofs() {
+    fun pairingCryptoDerivesSymmetricKeysSasAndValidatesConfirmations() {
         val alice = PairingCrypto.generateEphemeralKeyPair()
         val bob = PairingCrypto.generateEphemeralKeyPair()
 
@@ -61,87 +76,81 @@ class PairingFlowTest {
         )
         assertArrayEquals(secretAB, secretBA)
 
-        val sessionNonce = "00112233445566778899aabbccddeeff"
-        val pskRequester = PairingCrypto.derivePairingPsk(
+        val sessionId = "00112233445566778899aabbccddeeff"
+        val keysRequester = PairingCrypto.derivePairingKeys(
             sharedSecret = secretAB,
-            pin = "042-719",
-            sessionNonce = sessionNonce,
-            firstId = requesterIdentity.deviceId,
-            secondId = responderIdentity.deviceId,
+            sessionId = sessionId,
+            clientPub = alicePub,
+            serverPub = bobPub,
         )
-        val pskResponder = PairingCrypto.derivePairingPsk(
+        val keysResponder = PairingCrypto.derivePairingKeys(
             sharedSecret = secretBA,
-            pin = "042719",
-            sessionNonce = sessionNonce,
-            firstId = responderIdentity.deviceId,
-            secondId = requesterIdentity.deviceId,
+            sessionId = sessionId,
+            clientPub = alicePub,
+            serverPub = bobPub,
         )
-        assertEquals(32, pskRequester.size)
-        assertArrayEquals(pskRequester, pskResponder)
+        assertEquals(32, keysRequester.psk.size)
+        assertEquals(6, keysRequester.sas.length)
+        assertEquals(keysRequester, keysResponder)
 
-        val wrongPinPsk = PairingCrypto.derivePairingPsk(
+        val otherSessionKeys = PairingCrypto.derivePairingKeys(
             sharedSecret = secretAB,
-            pin = "042718",
-            sessionNonce = sessionNonce,
-            firstId = requesterIdentity.deviceId,
-            secondId = responderIdentity.deviceId,
+            sessionId = "ffeeddccbbaa99887766554433221100",
+            clientPub = alicePub,
+            serverPub = bobPub,
         )
-        assertFalse(pskRequester.contentEquals(wrongPinPsk))
+        assertFalse(keysRequester.psk.contentEquals(otherSessionKeys.psk))
+        assertFalse(keysRequester.confirmKey.contentEquals(otherSessionKeys.confirmKey))
 
-        val clientProof = PairingCrypto.computeClientProof(
-            psk = pskRequester,
-            sessionNonce = sessionNonce,
+        val clientConfirm = PairingCrypto.computeConfirm(
+            confirmKey = keysRequester.confirmKey,
+            role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+            sessionId = sessionId,
             requesterId = requesterIdentity.deviceId,
             responderId = responderIdentity.deviceId,
-            requesterPublicKeyBase64 = alicePub,
-            responderPublicKeyBase64 = bobPub,
         )
         assertTrue(
-            PairingCrypto.verifyClientProof(
-                psk = pskResponder,
-                sessionNonce = sessionNonce,
+            PairingCrypto.verifyConfirm(
+                confirmKey = keysResponder.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = sessionId,
                 requesterId = requesterIdentity.deviceId,
                 responderId = responderIdentity.deviceId,
-                requesterPublicKeyBase64 = alicePub,
-                responderPublicKeyBase64 = bobPub,
-                proofHex = clientProof,
+                macHex = clientConfirm,
             ),
         )
         assertFalse(
-            PairingCrypto.verifyClientProof(
-                psk = wrongPinPsk,
-                sessionNonce = sessionNonce,
+            PairingCrypto.verifyConfirm(
+                confirmKey = otherSessionKeys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = sessionId,
                 requesterId = requesterIdentity.deviceId,
                 responderId = responderIdentity.deviceId,
-                requesterPublicKeyBase64 = alicePub,
-                responderPublicKeyBase64 = bobPub,
-                proofHex = clientProof,
+                macHex = clientConfirm,
             ),
         )
 
-        val serverProof = PairingCrypto.computeServerProof(
-            psk = pskResponder,
-            sessionNonce = sessionNonce,
+        val serverConfirm = PairingCrypto.computeConfirm(
+            confirmKey = keysResponder.confirmKey,
+            role = PairingCrypto.CONFIRM_ROLE_SERVER,
+            sessionId = sessionId,
             requesterId = requesterIdentity.deviceId,
             responderId = responderIdentity.deviceId,
-            requesterPublicKeyBase64 = alicePub,
-            responderPublicKeyBase64 = bobPub,
         )
         assertTrue(
-            PairingCrypto.verifyServerProof(
-                psk = pskRequester,
-                sessionNonce = sessionNonce,
+            PairingCrypto.verifyConfirm(
+                confirmKey = keysRequester.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_SERVER,
+                sessionId = sessionId,
                 requesterId = requesterIdentity.deviceId,
                 responderId = responderIdentity.deviceId,
-                requesterPublicKeyBase64 = alicePub,
-                responderPublicKeyBase64 = bobPub,
-                proofHex = serverProof,
+                macHex = serverConfirm,
             ),
         )
     }
 
     @Test
-    fun pairingSessionServerAndClientCompleteMutualKeyExchange() = runBlocking {
+    fun pairingSessionServerAndClientCompleteSasApproveAndMutualConfirm() = runBlocking {
         var responderPairedPeer: PairedPeer? = null
         val server = PairingSessionServer(
             host = "127.0.0.1",
@@ -153,16 +162,37 @@ class PairingFlowTest {
 
         val port = server.start()
         try {
-            val waiting = server.state.value as PairingSessionState.WaitingForPeer
-            assertEquals(PairingSessionServer.DEFAULT_MAX_ATTEMPTS, waiting.attemptsRemaining)
+            assertTrue(server.state.value is PairingSessionState.WaitingForPeer)
 
-            val client = PairingClient(nowEpochSeconds = { 1_760_000_005L })
-            val result = client.pairWithHost(
-                host = "127.0.0.1",
-                port = port,
-                pin = waiting.pin,
-                localIdentity = requesterIdentity,
+            val client = PairingClient(
+                nowEpochSeconds = { 1_760_000_005L },
+                pollIntervalMs = 20L,
             )
+            val clientSasDeferred = kotlinx.coroutines.CompletableDeferred<Pair<String, String>>()
+            val pairDeferred = async {
+                client.pairWithHost(
+                    host = "127.0.0.1",
+                    port = port,
+                    localIdentity = requesterIdentity,
+                    onSasReady = { sas, name ->
+                        clientSasDeferred.complete(sas to name)
+                    },
+                )
+            }
+
+            val pending = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            val (clientSas, clientResponderName) = withTimeout(5_000L) {
+                clientSasDeferred.await()
+            }
+            assertEquals(pending.sas, clientSas)
+            assertEquals(responderIdentity.deviceName, clientResponderName)
+            assertEquals(requesterIdentity.deviceName, pending.requesterName)
+            assertNull("Peer must not be persisted before approval and confirm", responderPairedPeer)
+
+            assertTrue(server.approveSession(pending.sessionId))
+            val result = pairDeferred.await()
             assertTrue("Pairing should succeed: ${result.exceptionOrNull()}", result.isSuccess)
             val requesterPairedPeer = result.getOrThrow()
 
@@ -174,11 +204,10 @@ class PairingFlowTest {
             assertArrayEquals(storedOnResponder.psk, requesterPairedPeer.psk)
             assertTrue(server.state.value is PairingSessionState.Completed)
 
-            // Session must be single-use after completion
+            // Completed session must reject new pairing attempts until reset
             val secondAttempt = client.pairWithHost(
                 host = "127.0.0.1",
                 port = port,
-                pin = waiting.pin,
                 localIdentity = requesterIdentity,
             )
             assertTrue(secondAttempt.isFailure)
@@ -188,7 +217,7 @@ class PairingFlowTest {
     }
 
     @Test
-    fun pairingSessionServerLocksOutAfterFiveWrongPinsAndRegeneratesSession() = runBlocking {
+    fun pairingSessionRejectDoesNotPersistAndCanReset() = runBlocking {
         var responderPairedPeer: PairedPeer? = null
         val server = PairingSessionServer(
             host = "127.0.0.1",
@@ -199,57 +228,236 @@ class PairingFlowTest {
 
         val port = server.start()
         try {
-            val initial = server.state.value as PairingSessionState.WaitingForPeer
-            val wrongPin = if (initial.pin == "000000") "999999" else "000000"
-            val client = PairingClient()
-
-            for (attempt in 1 until PairingSessionServer.DEFAULT_MAX_ATTEMPTS) {
-                val fail = client.pairWithHost(
+            val client = PairingClient(pollIntervalMs = 20L)
+            val pairDeferred = async {
+                client.pairWithHost(
                     host = "127.0.0.1",
                     port = port,
-                    pin = wrongPin,
                     localIdentity = requesterIdentity,
-                )
-                assertTrue(fail.isFailure)
-                val state = server.state.value as PairingSessionState.WaitingForPeer
-                assertEquals(
-                    PairingSessionServer.DEFAULT_MAX_ATTEMPTS - attempt,
-                    state.attemptsRemaining,
                 )
             }
 
-            // 5th wrong PIN locks out the session
-            val fifthFail = client.pairWithHost(
-                host = "127.0.0.1",
-                port = port,
-                pin = wrongPin,
-                localIdentity = requesterIdentity,
-            )
-            assertTrue(fifthFail.isFailure)
-            assertTrue(server.state.value is PairingSessionState.LockedOut)
+            val pending = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            assertTrue(server.rejectSession(pending.sessionId))
 
-            // Even the old correct PIN must now be refused
-            val afterLockout = client.pairWithHost(
-                host = "127.0.0.1",
-                port = port,
-                pin = initial.pin,
-                localIdentity = requesterIdentity,
-            )
-            assertTrue(afterLockout.isFailure)
+            val rejectedResult = pairDeferred.await()
+            assertTrue(rejectedResult.isFailure)
+            assertNull(responderPairedPeer)
+            assertTrue(server.state.value is PairingSessionState.Rejected)
 
-            // Regenerating the session yields a fresh PIN that succeeds
-            server.regenerateSession()
-            val refreshed = server.state.value as PairingSessionState.WaitingForPeer
-            val success = client.pairWithHost(
-                host = "127.0.0.1",
-                port = port,
-                pin = refreshed.pin,
-                localIdentity = requesterIdentity,
-            )
+            // Resetting lets a fresh pairing session proceed
+            server.resetSession()
+            val retryDeferred = async {
+                client.pairWithHost(
+                    host = "127.0.0.1",
+                    port = port,
+                    localIdentity = requesterIdentity,
+                )
+            }
+            val nextPending = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            assertTrue(server.approveSession(nextPending.sessionId))
+            val success = retryDeferred.await()
             assertTrue(success.isSuccess)
             assertArrayEquals(responderPairedPeer!!.psk, success.getOrThrow().psk)
         } finally {
             server.stop()
+        }
+    }
+
+    @Test
+    fun pairingSessionTtlExpiryDoesNotPersist() = runBlocking {
+        var clock = 1_760_000_000L
+        var responderPairedPeer: PairedPeer? = null
+        val server = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = { peer -> responderPairedPeer = peer },
+            nowEpochSeconds = { clock },
+            sessionTtlSeconds = 60L,
+        )
+
+        val port = server.start()
+        try {
+            val client = PairingClient(
+                nowEpochSeconds = { clock },
+                pollIntervalMs = 20L,
+            )
+            val pairDeferred = async {
+                client.pairWithHost(
+                    host = "127.0.0.1",
+                    port = port,
+                    localIdentity = requesterIdentity,
+                )
+            }
+
+            withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            clock += 61L
+
+            val result = pairDeferred.await()
+            assertTrue(result.isFailure)
+            assertNull(responderPairedPeer)
+            assertTrue(server.state.value is PairingSessionState.Expired)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun tamperedClientConfirmRejectedWithoutPersisting() = runBlocking {
+        var responderPairedPeer: PairedPeer? = null
+        val server = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = { peer -> responderPairedPeer = peer },
+        )
+
+        val port = server.start()
+        try {
+            val clientKeyPair = PairingCrypto.generateEphemeralKeyPair()
+            val startConn = (URI.create("http://127.0.0.1:$port/pair/start").toURL().openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            startConn.outputStream.use {
+                it.write(
+                    ProtocolJson.encodePairStartRequest(
+                        PairStartRequest(
+                            version = PAIRING_PROTOCOL_VERSION,
+                            requesterId = requesterIdentity.deviceId,
+                            requesterName = requesterIdentity.deviceName,
+                            clientPub = PairingCrypto.encodePublicKey(clientKeyPair.public),
+                        ),
+                    ).toByteArray(Charsets.UTF_8),
+                )
+            }
+            assertEquals(200, startConn.responseCode)
+            val startResp = ProtocolJson.decodePairStartResponse(startConn.inputStream.bufferedReader().readText())
+            startConn.disconnect()
+
+            assertTrue(server.approveSession(startResp.sessionId))
+
+            val confirmConn = (URI.create("http://127.0.0.1:$port/pair/confirm").toURL().openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            confirmConn.outputStream.use {
+                it.write(
+                    ProtocolJson.encodePairConfirmRequest(
+                        PairConfirmRequest(
+                            version = PAIRING_PROTOCOL_VERSION,
+                            sessionId = startResp.sessionId,
+                            clientConfirm = "0".repeat(64),
+                        ),
+                    ).toByteArray(Charsets.UTF_8),
+                )
+            }
+            assertEquals(401, confirmConn.responseCode)
+            confirmConn.disconnect()
+            assertNull("Tampered clientConfirm must never persist peer", responderPairedPeer)
+            assertTrue(server.state.value is PairingSessionState.Rejected)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun tamperedServerConfirmRejectedByClientWithoutPersisting() = runBlocking {
+        val serverKeyPair = PairingCrypto.generateEphemeralKeyPair()
+        val serverPubBase64 = PairingCrypto.encodePublicKey(serverKeyPair.public)
+        val sessionId = "fake-session-123"
+
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { serverSocket ->
+            val serverThread = thread(isDaemon = true) {
+                runCatching {
+                    // 1. /pair/start
+                    serverSocket.accept().use { s ->
+                        val body = ProtocolJson.encodePairStartResponse(
+                            PairStartResponse(
+                                version = PAIRING_PROTOCOL_VERSION,
+                                sessionId = sessionId,
+                                responderId = responderIdentity.deviceId,
+                                responderName = responderIdentity.deviceName,
+                                serverPub = serverPubBase64,
+                            ),
+                        )
+                        writeHttpJsonResponse(s, body)
+                    }
+                    // 2. /pair/status
+                    serverSocket.accept().use { s ->
+                        val body = ProtocolJson.encodePairStatusResponse(
+                            PairStatusResponse(
+                                version = PAIRING_PROTOCOL_VERSION,
+                                sessionId = sessionId,
+                                status = PairSessionStatus.APPROVED,
+                            ),
+                        )
+                        writeHttpJsonResponse(s, body)
+                    }
+                    // 3. /pair/confirm with bogus serverConfirm
+                    serverSocket.accept().use { s ->
+                        val body = ProtocolJson.encodePairConfirmResponse(
+                            PairConfirmResponse(
+                                version = PAIRING_PROTOCOL_VERSION,
+                                sessionId = sessionId,
+                                serverConfirm = "f".repeat(64),
+                            ),
+                        )
+                        writeHttpJsonResponse(s, body)
+                    }
+                }
+            }
+
+            val result = PairingClient(pollIntervalMs = 10L).pairWithHost(
+                host = "127.0.0.1",
+                port = serverSocket.localPort,
+                localIdentity = requesterIdentity,
+            )
+            serverThread.join(2_000)
+            assertTrue("Expected tampered serverConfirm to fail", result.isFailure)
+        }
+    }
+
+    private fun writeHttpJsonResponse(socket: java.net.Socket, jsonBody: String) {
+        socket.soTimeout = 2_000
+        val reader = socket.getInputStream().bufferedReader(Charsets.US_ASCII)
+        var contentLength = 0
+        while (true) {
+            val line = reader.readLine() ?: break
+            if (line.isEmpty()) break
+            if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                contentLength = line.substringAfter(':').trim().toIntOrNull() ?: 0
+            }
+        }
+        if (contentLength > 0) {
+            val buf = CharArray(contentLength)
+            var read = 0
+            while (read < contentLength) {
+                val n = reader.read(buf, read, contentLength - read)
+                if (n == -1) break
+                read += n
+            }
+        }
+        val bodyBytes = jsonBody.toByteArray(Charsets.UTF_8)
+        val header = (
+            "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: ${bodyBytes.size}\r\n" +
+                "Connection: close\r\n\r\n"
+            ).toByteArray(Charsets.US_ASCII)
+        socket.getOutputStream().apply {
+            write(header)
+            write(bodyBytes)
+            flush()
         }
     }
 
@@ -316,15 +524,20 @@ class PairingFlowTest {
 
         val port = server.start()
         try {
-            val waiting = server.state.value as PairingSessionState.WaitingForPeer
             val target = parseManualPairingAddress("127.0.0.1:$port").getOrThrow()
-            val client = PairingClient()
-            val result = client.pairWithHost(
-                host = target.host,
-                port = target.port,
-                pin = waiting.pin,
-                localIdentity = requesterIdentity,
-            )
+            val client = PairingClient(pollIntervalMs = 20L)
+            val pairDeferred = async {
+                client.pairWithHost(
+                    host = target.host,
+                    port = target.port,
+                    localIdentity = requesterIdentity,
+                )
+            }
+            val pending = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            assertTrue(server.approveSession(pending.sessionId))
+            val result = pairDeferred.await()
             assertTrue("Pairing should succeed: ${result.exceptionOrNull()}", result.isSuccess)
             assertArrayEquals(responderPairedPeer!!.psk, result.getOrThrow().psk)
         } finally {
@@ -366,7 +579,6 @@ class PairingFlowTest {
                 val result = PairingClient().pairWithHost(
                     host = "127.0.0.1",
                     port = serverSocket.localPort,
-                    pin = "123456",
                     localIdentity = requesterIdentity,
                 )
                 serverThread.join(2_000)
@@ -418,7 +630,6 @@ class PairingFlowTest {
             ).pairWithHost(
                 host = "127.0.0.1",
                 port = serverSocket.localPort,
-                pin = "123456",
                 localIdentity = requesterIdentity,
             )
             val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L
@@ -534,29 +745,42 @@ class PairingFlowTest {
 
         val pairingPort = pairingServer.start()
         try {
-            val waiting = pairingServer.state.value as PairingSessionState.WaitingForPeer
             val manualTarget = parseManualPairingAddress("[::1]:$pairingPort").getOrThrow()
-            val pairingClient = PairingClient(nowEpochSeconds = { 1_760_000_005L })
-            val pairResult = pairingClient.pairWithHost(
-                host = manualTarget.host,
-                port = manualTarget.port,
-                pin = waiting.pin,
-                localIdentity = requesterIdentity,
+            val pairingClient = PairingClient(
+                nowEpochSeconds = { 1_760_000_005L },
+                pollIntervalMs = 20L,
             )
+            val pairDeferred = async {
+                pairingClient.pairWithHost(
+                    host = manualTarget.host,
+                    port = manualTarget.port,
+                    localIdentity = requesterIdentity,
+                )
+            }
+            val pendingIpv6 = withTimeout(5_000L) {
+                pairingServer.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            assertTrue(pairingServer.approveSession(pendingIpv6.sessionId))
+            val pairResult = pairDeferred.await()
             assertTrue("Pairing over ::1 should succeed: ${pairResult.exceptionOrNull()}", pairResult.isSuccess)
             val requesterPeer = pairResult.getOrThrow()
             val responderPeer = pairedOverIpv6!!
             assertArrayEquals(responderPeer.psk, requesterPeer.psk)
 
-            // Also verify dual-stack PairingSessionServer accepts IPv4 127.0.0.1 after regenerating session
-            pairingServer.regenerateSession()
-            val refreshed = pairingServer.state.value as PairingSessionState.WaitingForPeer
-            val ipv4PairResult = pairingClient.pairWithHost(
-                host = "127.0.0.1",
-                port = pairingPort,
-                pin = refreshed.pin,
-                localIdentity = requesterIdentity,
-            )
+            // Also verify dual-stack PairingSessionServer accepts IPv4 127.0.0.1 after resetting session
+            pairingServer.resetSession()
+            val ipv4PairDeferred = async {
+                pairingClient.pairWithHost(
+                    host = "127.0.0.1",
+                    port = pairingPort,
+                    localIdentity = requesterIdentity,
+                )
+            }
+            val pendingIpv4 = withTimeout(5_000L) {
+                pairingServer.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            assertTrue(pairingServer.approveSession(pendingIpv4.sessionId))
+            val ipv4PairResult = ipv4PairDeferred.await()
             assertTrue("Pairing over 127.0.0.1 on :: server should succeed", ipv4PairResult.isSuccess)
 
             // Follow up with an actual HolderHttpServer release request over ::1 using the paired PSK

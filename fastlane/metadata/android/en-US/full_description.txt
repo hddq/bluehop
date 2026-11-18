@@ -5,8 +5,8 @@ Instead of opening Bluetooth settings on the currently connected device to disco
 - Tap any managed Bluetooth device on the host you want to use it with.
 - BlueHop discovers paired BlueHop hosts via mDNS on the local network and checks which host currently holds the device.
 - The current holder disconnects the Bluetooth device over an authenticated local request, and the requesting host connects right away.
-- Hosts pair directly on your local Wi-Fi using a 6-digit PIN and store per-peer HMAC keys locally without any cloud servers.
+- Hosts pair directly on your local Wi-Fi using ephemeral ECDH (P-256) with 6-digit verification codes and store per-peer HMAC keys locally without any cloud servers.
 
 Requirements:
 - Android 17 (API level 37) or newer, using Android 17's public CompanionDeviceManager Bluetooth connect/disconnect APIs and local network permission.
-- Companion BlueHop hosts on the same Wi-Fi network (Android supported now, Linux coming soon).
+- Companion BlueHop hosts on the same Wi-Fi network (Android supported now, Linux pairing CLI available).

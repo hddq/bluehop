@@ -1,6 +1,7 @@
 package org.hddq.bluehop
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -9,14 +10,27 @@ import org.hddq.bluehop.protocol.GrabResponse
 import org.hddq.bluehop.protocol.GrabResponseStatus
 import org.hddq.bluehop.protocol.HmacSigner
 import org.hddq.bluehop.protocol.NonceReplayGuard
+import org.hddq.bluehop.protocol.PAIRING_PROTOCOL_VERSION
+import org.hddq.bluehop.protocol.PairSessionStatus
+import org.hddq.bluehop.protocol.PairingCrypto
 import org.hddq.bluehop.protocol.ProtocolJson
 import org.hddq.bluehop.protocol.ProtocolVerifier
 import org.hddq.bluehop.protocol.VerificationFailureReason
 import org.hddq.bluehop.protocol.VerificationResult
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECPrivateKeySpec
 
 class BlueHopProtocolTest {
 
@@ -39,12 +53,38 @@ class BlueHopProtocolTest {
     )
 
     @Serializable
+    private data class SasCaseVector(
+        val bytesHex: String,
+        val sas: String,
+    )
+
+    @Serializable
+    private data class PairingVector(
+        val pairingVersion: Int,
+        val sessionId: String,
+        val requesterId: String,
+        val responderId: String,
+        val clientPrivateKeyHex: String,
+        val serverPrivateKeyHex: String,
+        val clientPub: String,
+        val serverPub: String,
+        val sharedSecretHex: String,
+        val pskHex: String,
+        val confirmKeyHex: String,
+        val sas: String,
+        val clientConfirm: String,
+        val serverConfirm: String,
+        val sasCases: List<SasCaseVector>,
+    )
+
+    @Serializable
     private data class VectorFile(
         val protocolVersion: Int,
         val maxSkewSeconds: Long,
         val pskHex: String,
         val nowEpochSec: Long,
         val vectors: List<TestVector>,
+        val pairing: PairingVector,
     )
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -125,6 +165,142 @@ class BlueHopProtocolTest {
 
                 else -> error("Unknown vector kind: ${vector.kind}")
             }
+        }
+    }
+
+    @Test
+    fun pairingVectorsMatchKotlinImplementation() {
+        val pv = loadVectors().pairing
+        assertEquals(PAIRING_PROTOCOL_VERSION, pv.pairingVersion)
+
+        val decodedClientPub = PairingCrypto.decodePublicKey(pv.clientPub) as ECPublicKey
+        val decodedServerPub = PairingCrypto.decodePublicKey(pv.serverPub) as ECPublicKey
+        assertEquals(pv.clientPub, PairingCrypto.encodePublicKey(decodedClientPub))
+        assertEquals(pv.serverPub, PairingCrypto.encodePublicKey(decodedServerPub))
+
+        val keyFactory = KeyFactory.getInstance("EC")
+        val clientPriv = keyFactory.generatePrivate(
+            ECPrivateKeySpec(BigInteger(1, HmacSigner.fromHexOrNull(pv.clientPrivateKeyHex)!!), decodedClientPub.params),
+        )
+        val serverPriv = keyFactory.generatePrivate(
+            ECPrivateKeySpec(BigInteger(1, HmacSigner.fromHexOrNull(pv.serverPrivateKeyHex)!!), decodedServerPub.params),
+        )
+
+        val clientShared = PairingCrypto.computeSharedSecret(clientPriv, decodedServerPub)
+        val serverShared = PairingCrypto.computeSharedSecret(serverPriv, decodedClientPub)
+        assertArrayEquals(clientShared, serverShared)
+        assertEquals(pv.sharedSecretHex, HmacSigner.toHex(clientShared))
+
+        val keys = PairingCrypto.derivePairingKeys(
+            sharedSecret = clientShared,
+            sessionId = pv.sessionId,
+            clientPub = pv.clientPub,
+            serverPub = pv.serverPub,
+        )
+        assertEquals(pv.pskHex, keys.pskHex)
+        assertEquals(pv.confirmKeyHex, HmacSigner.toHex(keys.confirmKey))
+        assertEquals(pv.sas, keys.sas)
+
+        for (sc in pv.sasCases) {
+            val raw = HmacSigner.fromHexOrNull(sc.bytesHex)!!
+            assertEquals("SAS for ${sc.bytesHex}", sc.sas, PairingCrypto.sasFromBytes(raw))
+        }
+
+        val clientConfirm = PairingCrypto.computeConfirm(
+            confirmKey = keys.confirmKey,
+            role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+            sessionId = pv.sessionId,
+            requesterId = pv.requesterId,
+            responderId = pv.responderId,
+        )
+        assertEquals(pv.clientConfirm, clientConfirm)
+
+        val serverConfirm = PairingCrypto.computeConfirm(
+            confirmKey = keys.confirmKey,
+            role = PairingCrypto.CONFIRM_ROLE_SERVER,
+            sessionId = pv.sessionId,
+            requesterId = pv.requesterId,
+            responderId = pv.responderId,
+        )
+        assertEquals(pv.serverConfirm, serverConfirm)
+
+        assertTrue(
+            PairingCrypto.verifyConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = pv.sessionId,
+                requesterId = pv.requesterId,
+                responderId = pv.responderId,
+                macHex = pv.clientConfirm,
+            ),
+        )
+        assertTrue(
+            PairingCrypto.verifyConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_SERVER,
+                sessionId = pv.sessionId,
+                requesterId = pv.requesterId,
+                responderId = pv.responderId,
+                macHex = pv.serverConfirm,
+            ),
+        )
+        assertFalse(
+            PairingCrypto.verifyConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = pv.sessionId,
+                requesterId = pv.requesterId,
+                responderId = pv.responderId,
+                macHex = pv.serverConfirm,
+            ),
+        )
+        assertFalse(
+            PairingCrypto.verifyConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = "other-session",
+                requesterId = pv.requesterId,
+                responderId = pv.responderId,
+                macHex = pv.clientConfirm,
+            ),
+        )
+        assertFalse(
+            PairingCrypto.verifyConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = pv.sessionId,
+                requesterId = pv.responderId,
+                responderId = pv.requesterId,
+                macHex = pv.clientConfirm,
+            ),
+        )
+    }
+
+    @Test
+    fun decodePublicKeyRejectsInvalidAndNonP256Keys() {
+        assertThrows(IllegalArgumentException::class.java) {
+            PairingCrypto.decodePublicKey("not-valid-base64!!!")
+        }
+        assertThrows(Exception::class.java) {
+            PairingCrypto.decodePublicKey(
+                java.util.Base64.getEncoder().encodeToString("bad-der".toByteArray()),
+            )
+        }
+        val p384Gen = KeyPairGenerator.getInstance("EC")
+        p384Gen.initialize(ECGenParameterSpec("secp384r1"))
+        val p384PubBase64 = PairingCrypto.encodePublicKey(p384Gen.generateKeyPair().public)
+        assertThrows(IllegalArgumentException::class.java) {
+            PairingCrypto.decodePublicKey(p384PubBase64)
+        }
+    }
+
+    @Test
+    fun pairStatusJsonRejectsUnknownStatus() {
+        val valid = ProtocolJson.decodePairStatusResponse("""{"version":2,"sessionId":"s1","status":"approved"}""")
+        assertEquals(PairSessionStatus.APPROVED, valid.status)
+
+        assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairStatusResponse("""{"version":2,"sessionId":"s1","status":"bogus"}""")
         }
     }
 
