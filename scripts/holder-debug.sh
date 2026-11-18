@@ -12,7 +12,7 @@ set -euo pipefail
 #   REQUESTER_ID  Requester identifier included in the signed payload (default: pc-curl)
 #
 # To inspect the debug build's active PSK and device MAC via adb:
-#   adb shell am broadcast -a org.hddq.bluehop.DEBUG_DUMP_PSK -n org.hddq.bluehop/.debug.ProtocolSelfTestReceiver
+#   adb shell am broadcast -a org.hddq.bluehop.DEBUG_DUMP_PSK -n org.hddq.bluehop.debug/org.hddq.bluehop.debug.ProtocolSelfTestReceiver
 #   adb logcat -d -s BlueHopProtocol | tail -n 5
 
 usage() {
