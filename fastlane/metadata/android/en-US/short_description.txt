@@ -1,0 +1,1 @@
+Switch non-multipoint Bluetooth devices between your hosts over Wi-Fi
