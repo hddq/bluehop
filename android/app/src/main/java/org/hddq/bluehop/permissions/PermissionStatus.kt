@@ -10,7 +10,7 @@ enum class PermissionGrantStatus {
 
 data class ManagedPermission(
     val id: String,
-    val permission: String,
+    val permissions: List<String>,
     val title: String,
     val description: String,
     @param:DrawableRes val iconRes: Int,

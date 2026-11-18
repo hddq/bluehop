@@ -2,9 +2,7 @@
     <string name="app_name">BlueHop</string>
     <string name="permissions_section_title">Permissions</string>
     <string name="permission_nearby_devices_title">Nearby devices</string>
-    <string name="permission_nearby_devices_description">Find and connect to nearby Bluetooth devices</string>
-    <string name="permission_local_network_title">Local network</string>
-    <string name="permission_local_network_description">Advertise this phone and receive release requests over Wi-Fi</string>
+    <string name="permission_nearby_devices_description">Connect to Bluetooth devices and reach paired hosts on Wi-Fi</string>
     <string name="permission_status_allowed">Allowed</string>
     <string name="permission_status_denied_permanently">Denied in system settings. Open app settings to allow.</string>
     <string name="permission_action_allow">Allow</string>
@@ -31,7 +29,7 @@
     <string name="paired_hosts_action_remove">Remove paired host</string>
     <string name="paired_hosts_empty_title">No paired hosts</string>
     <string name="paired_hosts_empty_description">Pair another BlueHop device on the same Wi-Fi to exchange keys.</string>
-    <string name="paired_hosts_permission_required_description">Allow Local network permission above to pair with devices on Wi-Fi.</string>
+    <string name="paired_hosts_permission_required_description">Allow Nearby devices permission above to pair with devices on Wi-Fi.</string>
     <string name="paired_hosts_id_format">ID: %1$s</string>
 
     <string name="pairing_dialog_title">Pair host</string>
