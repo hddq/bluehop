@@ -1,0 +1,190 @@
+package protocol
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+type replayExpectation struct {
+	ExpectedValid  bool   `json:"expectedValid"`
+	ExpectedReason string `json:"expectedReason"`
+}
+
+type testVector struct {
+	Name              string             `json:"name"`
+	Kind              string             `json:"kind"`
+	CanonicalPayload  string             `json:"canonicalPayload"`
+	ExpectedNonce     string             `json:"expectedNonce"`
+	Payload           json.RawMessage    `json:"payload"`
+	ExpectedValid     bool               `json:"expectedValid"`
+	ExpectedReason    string             `json:"expectedReason"`
+	ReplaySecondCheck *replayExpectation `json:"replaySecondCheck"`
+}
+
+type vectorFile struct {
+	ProtocolVersion int          `json:"protocolVersion"`
+	MaxSkewSeconds  int64        `json:"maxSkewSeconds"`
+	PSKHex          string       `json:"pskHex"`
+	NowEpochSec     int64        `json:"nowEpochSec"`
+	Vectors         []testVector `json:"vectors"`
+}
+
+func loadTestVectors(t *testing.T) vectorFile {
+	t.Helper()
+	path := filepath.Join("..", "..", "..", "protocol", "test-vectors.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var vf vectorFile
+	if err := json.Unmarshal(data, &vf); err != nil {
+		t.Fatalf("unmarshal %s: %v", path, err)
+	}
+	return vf
+}
+
+func assertResult(t *testing.T, label string, got VerificationResult, wantValid bool, wantReason string) {
+	t.Helper()
+	if got.Valid != wantValid || string(got.Reason) != wantReason {
+		t.Fatalf("%s: got {Valid:%v Reason:%q}, want {Valid:%v Reason:%q}",
+			label, got.Valid, got.Reason, wantValid, wantReason)
+	}
+}
+
+func TestProtocolVectors(t *testing.T) {
+	vf := loadTestVectors(t)
+	psk, err := hex.DecodeString(vf.PSKHex)
+	if err != nil {
+		t.Fatalf("decode pskHex: %v", err)
+	}
+
+	guard := NewNonceReplayGuard(vf.MaxSkewSeconds*2, DefaultNonceMaxEntries)
+	verifier := NewProtocolVerifier(vf.MaxSkewSeconds, guard, func() int64 { return vf.NowEpochSec })
+
+	for _, vec := range vf.Vectors {
+		t.Run(vec.Name, func(t *testing.T) {
+			switch vec.Kind {
+			case "request":
+				var req GrabRequest
+				if err := json.Unmarshal(vec.Payload, &req); err != nil {
+					t.Fatalf("unmarshal request: %v", err)
+				}
+				if req.CanonicalPayload() != vec.CanonicalPayload {
+					t.Fatalf("canonical payload mismatch:\ngot:  %q\nwant: %q", req.CanonicalPayload(), vec.CanonicalPayload)
+				}
+				raw, err := json.Marshal(req)
+				if err != nil {
+					t.Fatalf("marshal request: %v", err)
+				}
+				var roundTrip GrabRequest
+				if err := json.Unmarshal(raw, &roundTrip); err != nil {
+					t.Fatalf("round-trip unmarshal request: %v", err)
+				}
+
+				res := verifier.VerifyRequest(roundTrip, psk)
+				assertResult(t, vec.Name, res, vec.ExpectedValid, vec.ExpectedReason)
+
+				if vec.ReplaySecondCheck != nil {
+					replay := verifier.VerifyRequest(roundTrip, psk)
+					assertResult(t, vec.Name+" replay", replay, vec.ReplaySecondCheck.ExpectedValid, vec.ReplaySecondCheck.ExpectedReason)
+				}
+
+			case "response":
+				var resp GrabResponse
+				if err := json.Unmarshal(vec.Payload, &resp); err != nil {
+					t.Fatalf("unmarshal response: %v", err)
+				}
+				if resp.CanonicalPayload() != vec.CanonicalPayload {
+					t.Fatalf("canonical payload mismatch:\ngot:  %q\nwant: %q", resp.CanonicalPayload(), vec.CanonicalPayload)
+				}
+				raw, err := json.Marshal(resp)
+				if err != nil {
+					t.Fatalf("marshal response: %v", err)
+				}
+				var roundTrip GrabResponse
+				if err := json.Unmarshal(raw, &roundTrip); err != nil {
+					t.Fatalf("round-trip unmarshal response: %v", err)
+				}
+
+				res := verifier.VerifyResponse(roundTrip, psk, vec.ExpectedNonce)
+				assertResult(t, vec.Name, res, vec.ExpectedValid, vec.ExpectedReason)
+
+			default:
+				t.Fatalf("unknown vector kind %q", vec.Kind)
+			}
+		})
+	}
+}
+
+func TestSigningAndReplayPruningAcrossWindow(t *testing.T) {
+	psk, err := hex.DecodeString("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatalf("decode psk: %v", err)
+	}
+
+	clock := int64(1700000000)
+	guard := NewNonceReplayGuard(60, 2)
+	verifier := NewProtocolVerifier(30, guard, func() int64 { return clock })
+
+	req1, err := SignRequest(psk, GrabRequest{
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		RequesterID:       "desktop",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-1",
+	})
+	if err != nil {
+		t.Fatalf("SignRequest: %v", err)
+	}
+
+	assertResult(t, "first request", verifier.VerifyRequest(req1, psk), true, "")
+	assertResult(t, "replayed request", verifier.VerifyRequest(req1, psk), false, string(ReasonReplayedNonce))
+
+	clock += 61
+	req2, err := SignRequest(psk, GrabRequest{
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		RequesterID:       "desktop",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-2",
+	})
+	if err != nil {
+		t.Fatalf("SignRequest 2: %v", err)
+	}
+	assertResult(t, "after expiry", verifier.VerifyRequest(req2, psk), true, "")
+	if guard.Size() != 1 {
+		t.Fatalf("expected expired nonce to be pruned, guard size = %d", guard.Size())
+	}
+
+	resp, err := SignResponse(psk, GrabResponse{
+		Status:            StatusError,
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-2",
+		Message:           "timeout",
+	})
+	if err != nil {
+		t.Fatalf("SignResponse: %v", err)
+	}
+	assertResult(t, "signed response", verifier.VerifyResponse(resp, psk, "nonce-2"), true, "")
+}
+
+func TestReplayGuardEvictsOldestAtCapacity(t *testing.T) {
+	guard := NewNonceReplayGuard(60, 2)
+	if !guard.CheckAndRecord("n1", 100, 100) {
+		t.Fatal("expected n1 to be accepted")
+	}
+	if !guard.CheckAndRecord("n2", 100, 100) {
+		t.Fatal("expected n2 to be accepted")
+	}
+	if !guard.CheckAndRecord("n3", 100, 100) {
+		t.Fatal("expected n3 to evict oldest and be accepted")
+	}
+	if guard.Size() != 2 {
+		t.Fatalf("expected size 2, got %d", guard.Size())
+	}
+	if guard.CheckAndRecord("n2", 100, 100) {
+		t.Fatal("expected n2 to still be rejected as replay")
+	}
+}
