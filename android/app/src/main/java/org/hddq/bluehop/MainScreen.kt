@@ -71,6 +71,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -109,12 +110,15 @@ import org.hddq.bluehop.server.NsdPeerDiscovery
 import org.hddq.bluehop.ui.theme.BlueHopTheme
 import java.util.Locale
 
+private const val GITHUB_REPOSITORY_URL = "https://github.com/hddq/bluehop"
+
 @Composable
 fun MainRoute(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val activity = LocalActivity.current
+    val uriHandler = LocalUriHandler.current
     val coroutineScope = rememberCoroutineScope()
     val repository = remember(context) { SelectedDeviceRepository.from(context) }
     val pairedPeersRepository = remember(context) { PairedPeersRepository.from(context) }
@@ -414,6 +418,12 @@ fun MainRoute(
                 pairedPeersRepository.removePeer(peer.peerId)
             }
         },
+        versionName = BuildConfig.VERSION_NAME,
+        onVersionClick = {
+            runCatching {
+                uriHandler.openUri(GITHUB_REPOSITORY_URL)
+            }
+        },
     )
 
     if (showPairingDialog) {
@@ -449,6 +459,8 @@ fun MainScreen(
     canPairHosts: Boolean = true,
     onPairHostClick: () -> Unit = {},
     onRemovePairedPeerClick: (PairedPeerSummary) -> Unit = {},
+    versionName: String = BuildConfig.VERSION_NAME,
+    onVersionClick: () -> Unit = {},
 ) {
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -683,6 +695,23 @@ fun MainScreen(
                             Text(text = stringResource(R.string.paired_hosts_action_pair))
                         }
                     }
+                }
+
+                item(key = "about_spacer") {
+                    Spacer(modifier = Modifier.height(14.dp))
+                }
+
+                item(key = "about_header") {
+                    SectionHeader(
+                        title = stringResource(R.string.about_section_title),
+                    )
+                }
+
+                item(key = "about_version") {
+                    VersionListItem(
+                        versionName = versionName,
+                        onClick = onVersionClick,
+                    )
                 }
 
                 item(key = "bottom_spacer") {
@@ -1105,6 +1134,53 @@ private fun PairedHostListItem(
                 style = MaterialTheme.typography.titleMedium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun VersionListItem(
+    versionName: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    SegmentedListItem(
+        onClick = onClick,
+        shapes = ListItemDefaults.segmentedShapes(index = 0, count = 1),
+        colors = ListItemDefaults.colors(
+            containerColor = MaterialTheme.colorScheme.surfaceBright,
+        ),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier,
+        leadingContent = {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_info),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        },
+        supportingContent = {
+            Text(
+                text = versionName,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        content = {
+            Text(
+                text = stringResource(R.string.about_version_title),
+                style = MaterialTheme.typography.titleMedium,
             )
         },
     )
