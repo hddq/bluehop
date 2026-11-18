@@ -125,8 +125,6 @@ jobs:
 
       - name: Collect release APKs
         id: collect_apks
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           mapfile -t apks < <(find android/app/build/outputs/apk -type f -path '*/release/*.apk' | sort)
@@ -144,7 +142,7 @@ jobs:
           mkdir -p release-assets
           for apk in "${apks[@]}"; do
             filename=$(basename "$apk")
-            cp "$apk" "release-assets/${filename%.apk}-${TAG}.apk"
+            cp "$apk" "release-assets/$filename"
           done
 
           {
