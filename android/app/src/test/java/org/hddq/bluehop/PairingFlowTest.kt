@@ -4,7 +4,6 @@ import kotlinx.coroutines.runBlocking
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
-import org.hddq.bluehop.server.HolderHttpServer
 import org.hddq.bluehop.server.ManualPairingTarget
 import org.hddq.bluehop.server.PairingClient
 import org.hddq.bluehop.server.PairingSessionServer
@@ -15,6 +14,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.InetAddress
+import java.net.ServerSocket
+import kotlin.concurrent.thread
 
 class PairingFlowTest {
 
@@ -244,8 +246,8 @@ class PairingFlowTest {
             parseManualPairingAddress("192.168.1.42:43215").getOrThrow(),
         )
         assertEquals(
-            ManualPairingTarget("192.168.1.42", HolderHttpServer.DEFAULT_PORT),
-            parseManualPairingAddress(" 192.168.1.42 ").getOrThrow(),
+            ManualPairingTarget("192.168.1.42", 43215),
+            parseManualPairingAddress(" 192.168.1.42:43215 ").getOrThrow(),
         )
         assertEquals(
             ManualPairingTarget("laptop.local", 9000),
@@ -256,12 +258,8 @@ class PairingFlowTest {
             parseManualPairingAddress("[::1]:8765").getOrThrow(),
         )
         assertEquals(
-            ManualPairingTarget("2001:db8::1", HolderHttpServer.DEFAULT_PORT),
-            parseManualPairingAddress("[2001:db8::1]").getOrThrow(),
-        )
-        assertEquals(
-            ManualPairingTarget("2001:db8::1", HolderHttpServer.DEFAULT_PORT),
-            parseManualPairingAddress("2001:db8::1").getOrThrow(),
+            ManualPairingTarget("2001:db8::1", 43215),
+            parseManualPairingAddress("[2001:db8::1]:43215").getOrThrow(),
         )
     }
 
@@ -270,6 +268,10 @@ class PairingFlowTest {
         val invalidInputs = listOf(
             "",
             "   ",
+            "192.168.1.42",
+            "http://laptop.local/",
+            "[2001:db8::1]",
+            "2001:db8::1",
             "https://192.168.1.42:8765",
             "192.168.1.42:",
             ":8765",
@@ -278,7 +280,7 @@ class PairingFlowTest {
             "192.168.1.42:abc",
             "192.168.1.42/pair",
             "192.168.1.42?a=b",
-            "user@192.168.1.42",
+            "user@192.168.1.42:8765",
             "192.168.1.42 8765",
             "[::1",
             "[::1]extra",
@@ -313,6 +315,44 @@ class PairingFlowTest {
             assertArrayEquals(responderPairedPeer!!.psk, result.getOrThrow().psk)
         } finally {
             server.stop()
+        }
+    }
+
+    @Test
+    fun pairingClientRejectsOversizedResponseBodies() = runBlocking {
+        for (statusLine in listOf("200 OK", "500 Internal Server Error")) {
+            ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { serverSocket ->
+                val serverThread = thread(isDaemon = true) {
+                    runCatching {
+                        serverSocket.accept().use { clientSocket ->
+                            val payloadSize = PairingClient.MAX_RESPONSE_BYTES + 1
+                            val header = (
+                                "HTTP/1.1 $statusLine\r\n" +
+                                    "Content-Type: application/json\r\n" +
+                                    "Content-Length: $payloadSize\r\n" +
+                                    "Connection: close\r\n\r\n"
+                                ).toByteArray(Charsets.US_ASCII)
+                            val out = clientSocket.getOutputStream()
+                            out.write(header)
+                            out.write(ByteArray(payloadSize) { 'a'.code.toByte() })
+                            out.flush()
+                        }
+                    }
+                }
+                val result = PairingClient().pairWithHost(
+                    host = "127.0.0.1",
+                    port = serverSocket.localPort,
+                    pin = "123456",
+                    localIdentity = requesterIdentity,
+                )
+                serverThread.join(2_000)
+                assertTrue("Expected failure for $statusLine", result.isFailure)
+                val message = result.exceptionOrNull()?.message.orEmpty()
+                assertTrue(
+                    "Expected size limit message for $statusLine, got: $message",
+                    "${PairingClient.MAX_RESPONSE_BYTES}" in message,
+                )
+            }
         }
     }
 

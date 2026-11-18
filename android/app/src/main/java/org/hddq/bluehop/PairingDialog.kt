@@ -2,7 +2,10 @@ package org.hddq.bluehop
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
@@ -60,6 +64,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -160,10 +165,49 @@ fun PairingDialog(
         }
     }
 
-    LaunchedEffect(mode, sessionState, context) {
-        if (mode == PairingMode.SHOW_CODE && sessionState is PairingSessionState.WaitingForPeer) {
-            localAddresses = withContext(Dispatchers.IO) {
-                resolveLocalIpAddresses(context)
+    val isWaitingForPeer = mode == PairingMode.SHOW_CODE &&
+        sessionState is PairingSessionState.WaitingForPeer
+    LaunchedEffect(isWaitingForPeer, context) {
+        if (!isWaitingForPeer) {
+            localAddresses = emptyList()
+            return@LaunchedEffect
+        }
+        val refreshSignals = Channel<Unit>(Channel.CONFLATED)
+        refreshSignals.trySend(Unit)
+        val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                refreshSignals.trySend(Unit)
+            }
+
+            override fun onLinkPropertiesChanged(
+                network: Network,
+                linkProperties: LinkProperties,
+            ) {
+                refreshSignals.trySend(Unit)
+            }
+
+            override fun onLost(network: Network) {
+                refreshSignals.trySend(Unit)
+            }
+        }
+        val registered = runCatching {
+            connectivityManager?.registerNetworkCallback(
+                NetworkRequest.Builder().build(),
+                callback,
+            )
+            connectivityManager != null
+        }.getOrDefault(false)
+        try {
+            for (signal in refreshSignals) {
+                localAddresses = emptyList()
+                localAddresses = withContext(Dispatchers.IO) {
+                    resolveLocalIpAddresses(context)
+                }
+            }
+        } finally {
+            if (registered) {
+                runCatching { connectivityManager?.unregisterNetworkCallback(callback) }
             }
         }
     }
@@ -259,13 +303,16 @@ fun PairingDialog(
                                 selectedPeerKey = null
                                 clientError = null
                             },
+                            onManualAddressFocus = {
+                                useManualAddress = true
+                                selectedPeerKey = null
+                                clientError = null
+                            },
                             onManualAddressChange = { raw ->
                                 manualAddressInput = raw
                                 if (raw.isNotBlank()) {
                                     useManualAddress = true
                                     selectedPeerKey = null
-                                } else if (discoveredPeers.isEmpty()) {
-                                    useManualAddress = false
                                 }
                                 clientError = null
                             },
@@ -496,6 +543,7 @@ private fun EnterCodeContent(
     pairedPeerName: String?,
     onPeerSelect: (DiscoveredBlueHopPeer) -> Unit,
     onManualAddressSelect: () -> Unit,
+    onManualAddressFocus: () -> Unit,
     onManualAddressChange: (String) -> Unit,
     onPinChange: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -673,7 +721,13 @@ private fun EnterCodeContent(
                     keyboardType = KeyboardType.Uri,
                     imeAction = ImeAction.Next,
                 ),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { focusState ->
+                        if (focusState.isFocused) {
+                            onManualAddressFocus()
+                        }
+                    },
             )
         }
 

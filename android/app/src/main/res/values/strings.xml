@@ -49,7 +49,7 @@
     <string name="pairing_enter_searching">Searching Wi-Fi for devices showing a code…</string>
     <string name="pairing_enter_manual_option">Enter address manually</string>
     <string name="pairing_enter_address_label">Host address</string>
-    <string name="pairing_enter_address_placeholder">192.168.1.10:8765</string>
+    <string name="pairing_enter_address_placeholder">192.168.1.10:43215</string>
     <string name="pairing_enter_pin_label">6-digit code</string>
     <string name="pairing_action_connect_pair">Pair</string>
     <string name="pairing_status_pairing">Exchanging keys…</string>
