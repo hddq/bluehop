@@ -618,23 +618,9 @@ fun MainScreen(
                 }
 
                 item(key = "paired_hosts_header") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        SectionHeader(
-                            title = stringResource(R.string.paired_hosts_section_title),
-                            modifier = Modifier.weight(1f),
-                        )
-                        if (canPairHosts || pairedPeers.isNotEmpty()) {
-                            FilledTonalButton(
-                                onClick = onPairHostClick,
-                                shapes = ButtonDefaults.shapes(),
-                            ) {
-                                Text(text = stringResource(R.string.paired_hosts_action_pair))
-                            }
-                        }
-                    }
+                    SectionHeader(
+                        title = stringResource(R.string.paired_hosts_section_title),
+                    )
                 }
 
                 if (!canPairHosts && pairedPeers.isEmpty()) {
@@ -675,6 +661,27 @@ fun MainScreen(
                             onRemoveClick = { onRemovePairedPeerClick(peer) },
                             modifier = Modifier.animateItem(),
                         )
+                    }
+                }
+
+                if (canPairHosts || pairedPeers.isNotEmpty()) {
+                    item(key = "paired_hosts_pair_action") {
+                        FilledTonalButton(
+                            onClick = onPairHostClick,
+                            shapes = ButtonDefaults.shapes(),
+                            contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
+                            modifier = Modifier
+                                .animateItem()
+                                .padding(top = 6.dp),
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_add),
+                                contentDescription = null,
+                                modifier = Modifier.size(ButtonDefaults.IconSize),
+                            )
+                            Spacer(modifier = Modifier.width(ButtonDefaults.IconSpacing))
+                            Text(text = stringResource(R.string.paired_hosts_action_pair))
+                        }
                     }
                 }
 
