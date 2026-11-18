@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -187,4 +188,89 @@ func TestReplayGuardEvictsOldestAtCapacity(t *testing.T) {
 	if guard.CheckAndRecord("n2", 100, 100) {
 		t.Fatal("expected n2 to still be rejected as replay")
 	}
+}
+
+func TestTimestampSkewNoOverflow(t *testing.T) {
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	clock := int64(1700000000)
+	verifier := NewProtocolVerifier(30, nil, func() int64 { return clock })
+
+	// Previously absInt64(clock - extremeTS) could overflow to math.MinInt64 (< 0 <= 30).
+	extremeTS := clock + math.MinInt64
+	req, err := SignRequest(psk, GrabRequest{
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		RequesterID:       "desktop",
+		TimestampEpochSec: extremeTS,
+		Nonce:             "nonce-overflow",
+	})
+	if err != nil {
+		t.Fatalf("SignRequest: %v", err)
+	}
+	assertResult(t, "overflow request", verifier.VerifyRequest(req, psk), false, string(ReasonTimestampOutOfWindow))
+
+	resp, err := SignResponse(psk, GrabResponse{
+		Status:            StatusOK,
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		TimestampEpochSec: extremeTS,
+		Nonce:             "nonce-overflow",
+	})
+	if err != nil {
+		t.Fatalf("SignResponse: %v", err)
+	}
+	assertResult(t, "overflow response", verifier.VerifyResponse(resp, psk, "nonce-overflow"), false, string(ReasonTimestampOutOfWindow))
+}
+
+func TestValidationRejectsMissingStatusNewlinesAndInvalidUTF8(t *testing.T) {
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	clock := int64(1700000000)
+	verifier := NewProtocolVerifier(30, nil, func() int64 { return clock })
+
+	if _, err := SignResponse(psk, GrabResponse{
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-1",
+	}); err == nil {
+		t.Fatal("expected SignResponse to reject missing status")
+	}
+
+	var omitted GrabResponse
+	if err := json.Unmarshal([]byte(`{"version":1,"deviceAddress":"AA:BB:CC:DD:EE:FF","timestampEpochSec":1700000000,"nonce":"nonce-1","signature":"`+
+		func() string {
+			sig, _ := Sign(psk, GrabResponse{Version: 1, DeviceAddress: "AA:BB:CC:DD:EE:FF", TimestampEpochSec: clock, Nonce: "nonce-1"}.CanonicalPayload())
+			return sig
+		}()+`"}`), &omitted); err != nil {
+		t.Fatalf("unmarshal omitted status: %v", err)
+	}
+	assertResult(t, "omitted status", verifier.VerifyResponse(omitted, psk, "nonce-1"), false, string(ReasonInvalidFormat))
+
+	if _, err := SignRequest(psk, GrabRequest{
+		DeviceAddress:     "AA:BB\nCC",
+		RequesterID:       "desktop",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-nl",
+	}); err == nil {
+		t.Fatal("expected SignRequest to reject newline in DeviceAddress")
+	}
+
+	if _, err := SignRequest(psk, GrabRequest{
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		RequesterID:       "bad\xffutf8",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-utf8",
+	}); err == nil {
+		t.Fatal("expected SignRequest to reject invalid UTF-8")
+	}
+
+	// Newlines remain allowed in the final Message field.
+	resp, err := SignResponse(psk, GrabResponse{
+		Status:            StatusError,
+		DeviceAddress:     "AA:BB:CC:DD:EE:FF",
+		TimestampEpochSec: clock,
+		Nonce:             "nonce-msg-nl",
+		Message:           "line1\nline2",
+	})
+	if err != nil {
+		t.Fatalf("expected newline in Message to succeed: %v", err)
+	}
+	assertResult(t, "multiline message", verifier.VerifyResponse(resp, psk, "nonce-msg-nl"), true, "")
 }

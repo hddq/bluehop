@@ -11,15 +11,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	ProtocolVersion             = 1
-	DefaultMaxSkewSeconds       = int64(30)
-	DefaultNonceRetentionSec    = int64(60)
-	DefaultNonceMaxEntries      = 256
-	expectedSignatureHexLen     = 64
-	nonceByteLen                = 16
+	ProtocolVersion          = 1
+	DefaultMaxSkewSeconds    = int64(30)
+	DefaultNonceRetentionSec = int64(60)
+	DefaultNonceMaxEntries   = 256
+	expectedSignatureHexLen  = 64
+	nonceByteLen             = 16
 )
 
 type GrabResponseStatus string
@@ -30,18 +31,26 @@ const (
 	StatusError    GrabResponseStatus = "error"
 )
 
+func (s GrabResponseStatus) IsValid() bool {
+	switch s {
+	case StatusOK, StatusRejected, StatusError:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *GrabResponseStatus) UnmarshalJSON(data []byte) error {
 	var raw string
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	switch GrabResponseStatus(raw) {
-	case StatusOK, StatusRejected, StatusError:
-		*s = GrabResponseStatus(raw)
-		return nil
-	default:
+	status := GrabResponseStatus(raw)
+	if !status.IsValid() {
 		return fmt.Errorf("invalid grab response status: %q", raw)
 	}
+	*s = status
+	return nil
 }
 
 type GrabRequest struct {
@@ -130,6 +139,11 @@ func SignRequest(psk []byte, req GrabRequest) (GrabRequest, error) {
 	if req.Version == 0 {
 		req.Version = ProtocolVersion
 	}
+	if !isValidSingleLineField(req.DeviceAddress) ||
+		!isValidSingleLineField(req.RequesterID) ||
+		!isValidSingleLineField(req.Nonce) {
+		return GrabRequest{}, errors.New("invalid grab request fields")
+	}
 	sig, err := Sign(psk, req.CanonicalPayload())
 	if err != nil {
 		return GrabRequest{}, err
@@ -141,6 +155,14 @@ func SignRequest(psk []byte, req GrabRequest) (GrabRequest, error) {
 func SignResponse(psk []byte, resp GrabResponse) (GrabResponse, error) {
 	if resp.Version == 0 {
 		resp.Version = ProtocolVersion
+	}
+	if !resp.Status.IsValid() {
+		return GrabResponse{}, fmt.Errorf("invalid grab response status: %q", resp.Status)
+	}
+	if !isValidSingleLineField(resp.DeviceAddress) ||
+		!isValidSingleLineField(resp.Nonce) ||
+		!utf8.ValidString(resp.Message) {
+		return GrabResponse{}, errors.New("invalid grab response fields")
 	}
 	sig, err := Sign(psk, resp.CanonicalPayload())
 	if err != nil {
@@ -249,16 +271,16 @@ func (v *ProtocolVerifier) VerifyRequest(req GrabRequest, psk []byte) Verificati
 	if req.Version != ProtocolVersion {
 		return VerificationResult{Reason: ReasonUnsupportedVersion}
 	}
-	if strings.TrimSpace(req.DeviceAddress) == "" ||
-		strings.TrimSpace(req.RequesterID) == "" ||
-		strings.TrimSpace(req.Nonce) == "" {
+	if !isValidSingleLineField(req.DeviceAddress) ||
+		!isValidSingleLineField(req.RequesterID) ||
+		!isValidSingleLineField(req.Nonce) {
 		return VerificationResult{Reason: ReasonInvalidFormat}
 	}
 	if !VerifySignature(psk, req.CanonicalPayload(), req.Signature) {
 		return VerificationResult{Reason: ReasonInvalidSignature}
 	}
 	now := v.nowEpochSeconds()
-	if absInt64(now-req.TimestampEpochSec) > v.maxSkewSeconds {
+	if !withinSkewWindow(req.TimestampEpochSec, now, v.maxSkewSeconds) {
 		return VerificationResult{Reason: ReasonTimestampOutOfWindow}
 	}
 	if !v.replayGuard.CheckAndRecord(req.Nonce, req.TimestampEpochSec, now) {
@@ -271,14 +293,17 @@ func (v *ProtocolVerifier) VerifyResponse(resp GrabResponse, psk []byte, expecte
 	if resp.Version != ProtocolVersion {
 		return VerificationResult{Reason: ReasonUnsupportedVersion}
 	}
-	if strings.TrimSpace(resp.DeviceAddress) == "" || strings.TrimSpace(resp.Nonce) == "" {
+	if !resp.Status.IsValid() ||
+		!isValidSingleLineField(resp.DeviceAddress) ||
+		!isValidSingleLineField(resp.Nonce) ||
+		!utf8.ValidString(resp.Message) {
 		return VerificationResult{Reason: ReasonInvalidFormat}
 	}
 	if !VerifySignature(psk, resp.CanonicalPayload(), resp.Signature) {
 		return VerificationResult{Reason: ReasonInvalidSignature}
 	}
 	now := v.nowEpochSeconds()
-	if absInt64(now-resp.TimestampEpochSec) > v.maxSkewSeconds {
+	if !withinSkewWindow(resp.TimestampEpochSec, now, v.maxSkewSeconds) {
 		return VerificationResult{Reason: ReasonTimestampOutOfWindow}
 	}
 	if expectedNonce != "" && resp.Nonce != expectedNonce {
@@ -287,9 +312,18 @@ func (v *ProtocolVerifier) VerifyResponse(resp GrabResponse, psk []byte, expecte
 	return VerificationResult{Valid: true}
 }
 
-func absInt64(v int64) int64 {
-	if v < 0 {
-		return -v
+func isValidSingleLineField(s string) bool {
+	return strings.TrimSpace(s) != "" &&
+		utf8.ValidString(s) &&
+		!strings.ContainsAny(s, "\r\n")
+}
+
+func withinSkewWindow(ts, now, maxSkew int64) bool {
+	if maxSkew < 0 {
+		return false
 	}
-	return v
+	if ts >= now {
+		return uint64(ts)-uint64(now) <= uint64(maxSkew)
+	}
+	return uint64(now)-uint64(ts) <= uint64(maxSkew)
 }

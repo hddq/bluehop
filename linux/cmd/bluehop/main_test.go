@@ -24,6 +24,12 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if !strings.HasPrefix(stdout.String(), "bluehop ") {
 		t.Fatalf("expected version output, got %q", stdout.String())
 	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"version", "extra"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected exit 2 for extra args on version, got %d", code)
+	}
 }
 
 func TestFormatBuildVersion(t *testing.T) {

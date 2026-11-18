@@ -9,7 +9,7 @@ import (
 )
 
 // version can be overridden at link time via:
-// go build -ldflags "-X main.version=v0.1.0" ./cmd/bluehop
+// go build -ldflags "-X main.version=v0.1.0" -o build/bluehop ./cmd/bluehop
 var version = "dev"
 
 func main() {
@@ -43,7 +43,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch fs.Arg(0) {
 	case "version":
-		fmt.Fprintf(stdout, "bluehop %s\n", resolveVersion())
+		if fs.NArg() > 1 {
+			fmt.Fprintf(stderr, "version command does not accept arguments: %v\n\n", fs.Args()[1:])
+			fs.Usage()
+			return 2
+		}
+		if _, err := fmt.Fprintf(stdout, "bluehop %s\n", resolveVersion()); err != nil {
+			fmt.Fprintf(stderr, "failed to write version output: %v\n", err)
+			return 1
+		}
 		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n\n", fs.Arg(0))
