@@ -737,6 +737,7 @@ private fun PermissionListItem(
         colors = ListItemDefaults.colors(
             containerColor = MaterialTheme.colorScheme.surfaceBright,
         ),
+        verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
         leadingContent = {
             Surface(
@@ -894,6 +895,7 @@ private fun BondedDeviceListItem(
         colors = ListItemDefaults.colors(
             containerColor = MaterialTheme.colorScheme.surfaceBright,
         ),
+        verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
         leadingContent = {
             Surface(
@@ -999,6 +1001,7 @@ private fun DeviceStateListItem(
         colors = ListItemDefaults.colors(
             containerColor = MaterialTheme.colorScheme.surfaceBright,
         ),
+        verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
         leadingContent = {
             Surface(
@@ -1054,6 +1057,7 @@ private fun PairedHostListItem(
         colors = ListItemDefaults.colors(
             containerColor = MaterialTheme.colorScheme.surfaceBright,
         ),
+        verticalAlignment = Alignment.CenterVertically,
         modifier = modifier,
         leadingContent = {
             Surface(

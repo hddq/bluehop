@@ -469,6 +469,7 @@ private fun EnterCodeContent(
                         colors = ListItemDefaults.segmentedColors(
                             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                         ),
+                        verticalAlignment = Alignment.CenterVertically,
                         leadingContent = {
                             Surface(
                                 shape = CircleShape,
