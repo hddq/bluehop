@@ -15,11 +15,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -305,7 +305,7 @@ private fun ShowCodeContent(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    LoadingIndicator(modifier = Modifier.size(24.dp))
                     Text(
                         text = stringResource(R.string.pairing_show_waiting),
                         style = MaterialTheme.typography.bodyMedium,
@@ -446,7 +446,7 @@ private fun EnterCodeContent(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                LoadingIndicator(modifier = Modifier.size(24.dp))
                 Text(
                     text = stringResource(R.string.pairing_enter_searching),
                     style = MaterialTheme.typography.bodyMedium,
@@ -534,7 +534,7 @@ private fun EnterCodeContent(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                LoadingIndicator(modifier = Modifier.size(20.dp))
                 Text(
                     text = stringResource(R.string.pairing_status_pairing),
                     style = MaterialTheme.typography.bodySmall,
