@@ -1,5 +1,13 @@
 package org.hddq.bluehop
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -10,14 +18,19 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
@@ -41,11 +54,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,6 +68,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -65,6 +82,9 @@ import org.hddq.bluehop.server.NsdPeerDiscovery
 import org.hddq.bluehop.server.PairingClient
 import org.hddq.bluehop.server.PairingSessionServer
 import org.hddq.bluehop.server.PairingSessionState
+import org.hddq.bluehop.server.parseManualPairingAddress
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 enum class PairingMode {
     SHOW_CODE,
@@ -81,8 +101,11 @@ fun PairingDialog(
     val coroutineScope = rememberCoroutineScope()
     var mode by rememberSaveable { mutableStateOf(PairingMode.SHOW_CODE) }
     var localIdentity by remember { mutableStateOf<LocalDeviceIdentity?>(null) }
+    var localAddresses by remember { mutableStateOf<List<String>>(emptyList()) }
 
     var selectedPeerKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var useManualAddress by rememberSaveable { mutableStateOf(false) }
+    var manualAddressInput by rememberSaveable { mutableStateOf("") }
     var pinInput by rememberSaveable { mutableStateOf("") }
     var isPairing by remember { mutableStateOf(false) }
     var clientError by remember { mutableStateOf<String?>(null) }
@@ -147,8 +170,57 @@ fun PairingDialog(
         }
     }
 
-    LaunchedEffect(discoveredPeers) {
-        if (discoveredPeers.size == 1) {
+    val isWaitingForPeer = mode == PairingMode.SHOW_CODE &&
+        sessionState is PairingSessionState.WaitingForPeer
+    LaunchedEffect(isWaitingForPeer, context) {
+        if (!isWaitingForPeer) {
+            localAddresses = emptyList()
+            return@LaunchedEffect
+        }
+        val refreshSignals = Channel<Unit>(Channel.CONFLATED)
+        refreshSignals.trySend(Unit)
+        val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                refreshSignals.trySend(Unit)
+            }
+
+            override fun onLinkPropertiesChanged(
+                network: Network,
+                linkProperties: LinkProperties,
+            ) {
+                refreshSignals.trySend(Unit)
+            }
+
+            override fun onLost(network: Network) {
+                refreshSignals.trySend(Unit)
+            }
+        }
+        val registered = runCatching {
+            connectivityManager?.registerNetworkCallback(
+                NetworkRequest.Builder().build(),
+                callback,
+            )
+            connectivityManager != null
+        }.getOrDefault(false)
+        try {
+            for (signal in refreshSignals) {
+                localAddresses = emptyList()
+                localAddresses = withContext(Dispatchers.IO) {
+                    resolveLocalIpAddresses(context)
+                }
+            }
+        } finally {
+            if (registered) {
+                runCatching { connectivityManager?.unregisterNetworkCallback(callback) }
+            }
+        }
+    }
+
+    LaunchedEffect(discoveredPeers, useManualAddress) {
+        if (useManualAddress) {
+            selectedPeerKey = null
+        } else if (discoveredPeers.size == 1) {
             selectedPeerKey = discoveredPeers.first().stableKey
         } else if (discoveredPeers.none { it.stableKey == selectedPeerKey }) {
             selectedPeerKey = null
@@ -158,6 +230,7 @@ fun PairingDialog(
     val selectedPeer: DiscoveredBlueHopPeer? = discoveredPeers.firstOrNull {
         it.stableKey == selectedPeerKey
     }
+    val usingManualEntry = useManualAddress || discoveredPeers.isEmpty()
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -166,7 +239,9 @@ fun PairingDialog(
         },
         text = {
             Column(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 SingleChoiceSegmentedButtonRow(
@@ -208,6 +283,7 @@ fun PairingDialog(
                     PairingMode.SHOW_CODE -> {
                         ShowCodeContent(
                             deviceName = localIdentity?.deviceName.orEmpty(),
+                            localAddresses = localAddresses,
                             sessionState = sessionState,
                         )
                     }
@@ -216,12 +292,33 @@ fun PairingDialog(
                         EnterCodeContent(
                             discoveredPeers = discoveredPeers,
                             selectedPeerKey = selectedPeerKey,
+                            useManualAddress = useManualAddress,
+                            manualAddressInput = manualAddressInput,
                             pinInput = pinInput,
                             isPairing = isPairing,
                             errorMessage = clientError,
                             pairedPeerName = clientPairedName,
                             onPeerSelect = { peer ->
+                                useManualAddress = false
                                 selectedPeerKey = peer.stableKey
+                                clientError = null
+                            },
+                            onManualAddressSelect = {
+                                useManualAddress = true
+                                selectedPeerKey = null
+                                clientError = null
+                            },
+                            onManualAddressFocus = {
+                                useManualAddress = true
+                                selectedPeerKey = null
+                                clientError = null
+                            },
+                            onManualAddressChange = { raw ->
+                                manualAddressInput = raw
+                                if (raw.isNotBlank()) {
+                                    useManualAddress = true
+                                    selectedPeerKey = null
+                                }
                                 clientError = null
                             },
                             onPinChange = { raw ->
@@ -237,29 +334,50 @@ fun PairingDialog(
             if (mode == PairingMode.ENTER_CODE && clientPairedName == null) {
                 val canSubmit = !isPairing &&
                     localIdentity != null &&
-                    selectedPeer != null &&
-                    pinInput.length == 6
+                    pinInput.length == 6 &&
+                    if (usingManualEntry) {
+                        manualAddressInput.isNotBlank()
+                    } else {
+                        selectedPeer != null
+                    }
                 Button(
                     enabled = canSubmit,
                     shapes = ButtonDefaults.shapes(),
                     onClick = {
                         val identity = localIdentity ?: return@Button
-                        val target = selectedPeer ?: return@Button
+                        val targetHost: String
+                        val targetPort: Int
+                        if (usingManualEntry) {
+                            val parsed = parseManualPairingAddress(manualAddressInput)
+                            val target = parsed.getOrElse { error ->
+                                clientError = error.message ?: "Invalid host address"
+                                return@Button
+                            }
+                            targetHost = target.host
+                            targetPort = target.port
+                        } else {
+                            val target = selectedPeer ?: return@Button
+                            targetHost = target.host
+                            targetPort = target.port
+                        }
                         isPairing = true
                         clientError = null
                         coroutineScope.launch {
-                            val result = pairingClient.pairWithHost(
-                                host = target.host,
-                                port = target.port,
-                                pin = pinInput,
-                                localIdentity = identity,
-                            )
-                            isPairing = false
-                            result.onSuccess { peer ->
-                                pairedPeersRepository.upsertPeer(peer)
-                                clientPairedName = peer.peerName
-                            }.onFailure { error ->
-                                clientError = error.message ?: "Pairing failed"
+                            try {
+                                val result = pairingClient.pairWithHost(
+                                    host = targetHost,
+                                    port = targetPort,
+                                    pin = pinInput,
+                                    localIdentity = identity,
+                                )
+                                result.onSuccess { peer ->
+                                    pairedPeersRepository.upsertPeer(peer)
+                                    clientPairedName = peer.peerName
+                                }.onFailure { error ->
+                                    clientError = error.message ?: "Pairing failed"
+                                }
+                            } finally {
+                                isPairing = false
                             }
                         }
                     },
@@ -293,10 +411,12 @@ fun PairingDialog(
 @Composable
 private fun ShowCodeContent(
     deviceName: String,
+    localAddresses: List<String>,
     sessionState: PairingSessionState,
+    modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         when (sessionState) {
@@ -346,6 +466,100 @@ private fun ShowCodeContent(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+                if (sessionState.port > 0) {
+                    val endpoints = localAddresses.map { host ->
+                        PairingClient.formatHostPort(host, sessionState.port)
+                    }
+                    if (endpoints.isNotEmpty()) {
+                        val context = LocalContext.current
+                        val clipboardManager = remember(context) {
+                            context.getSystemService(ClipboardManager::class.java)
+                        }
+                        var copiedEndpoint by remember { mutableStateOf<String?>(null) }
+                        LaunchedEffect(copiedEndpoint) {
+                            if (copiedEndpoint != null) {
+                                delay(2_000)
+                                copiedEndpoint = null
+                            }
+                        }
+                        val addressLabel = stringResource(R.string.pairing_show_addresses_label)
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = addressLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            endpoints.forEach { endpoint ->
+                                val isCopied = copiedEndpoint == endpoint
+                                Surface(
+                                    shape = MaterialTheme.shapes.small,
+                                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(start = 12.dp, end = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        SelectionContainer(
+                                            modifier = Modifier.weight(1f),
+                                        ) {
+                                            Text(
+                                                text = endpoint,
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    fontFamily = FontFamily.Monospace,
+                                                ),
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                clipboardManager?.setPrimaryClip(
+                                                    ClipData.newPlainText(
+                                                        addressLabel,
+                                                        endpoint,
+                                                    ),
+                                                )
+                                                copiedEndpoint = endpoint
+                                            },
+                                            shapes = IconButtonDefaults.shapes(),
+                                        ) {
+                                            Icon(
+                                                painter = painterResource(
+                                                    if (isCopied) R.drawable.ic_check else R.drawable.ic_content_copy,
+                                                ),
+                                                contentDescription = stringResource(
+                                                    R.string.pairing_action_copy_address,
+                                                    endpoint,
+                                                ),
+                                                tint = if (isCopied) {
+                                                    MaterialTheme.colorScheme.primary
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                },
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        SelectionContainer {
+                            Text(
+                                text = stringResource(R.string.pairing_show_port, sessionState.port),
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                ),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
                 if (sessionState.attemptsRemaining < PairingSessionServer.DEFAULT_MAX_ATTEMPTS) {
                     Text(
@@ -404,15 +618,21 @@ private fun ShowCodeContent(
 private fun EnterCodeContent(
     discoveredPeers: List<DiscoveredBlueHopPeer>,
     selectedPeerKey: String?,
+    useManualAddress: Boolean,
+    manualAddressInput: String,
     pinInput: String,
     isPairing: Boolean,
     errorMessage: String?,
     pairedPeerName: String?,
     onPeerSelect: (DiscoveredBlueHopPeer) -> Unit,
+    onManualAddressSelect: () -> Unit,
+    onManualAddressFocus: () -> Unit,
+    onManualAddressChange: (String) -> Unit,
     onPinChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (pairedPeerName != null) {
@@ -454,17 +674,19 @@ private fun EnterCodeContent(
                 )
             }
         } else {
+            val itemCount = discoveredPeers.size + 1
             Column(
                 verticalArrangement = Arrangement.spacedBy(ListItemDefaults.SegmentedGap),
             ) {
                 discoveredPeers.forEachIndexed { index, peer ->
-                    val selected = peer.stableKey == selectedPeerKey
+                    val selected = !useManualAddress && peer.stableKey == selectedPeerKey
                     SegmentedListItem(
                         selected = selected,
+                        enabled = !isPairing,
                         onClick = { onPeerSelect(peer) },
                         shapes = ListItemDefaults.segmentedShapes(
                             index = index,
-                            count = discoveredPeers.size,
+                            count = itemCount,
                         ),
                         colors = ListItemDefaults.segmentedColors(
                             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -516,7 +738,80 @@ private fun EnterCodeContent(
                         },
                     )
                 }
+
+                SegmentedListItem(
+                    selected = useManualAddress,
+                    enabled = !isPairing,
+                    onClick = onManualAddressSelect,
+                    shapes = ListItemDefaults.segmentedShapes(
+                        index = discoveredPeers.size,
+                        count = itemCount,
+                    ),
+                    colors = ListItemDefaults.segmentedColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    ),
+                    verticalAlignment = Alignment.CenterVertically,
+                    leadingContent = {
+                        Surface(
+                            shape = CircleShape,
+                            color = if (useManualAddress) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.secondaryContainer
+                            },
+                            contentColor = if (useManualAddress) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSecondaryContainer
+                            },
+                            modifier = Modifier.size(36.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_devices),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    },
+                    trailingContent = {
+                        RadioButton(
+                            selected = useManualAddress,
+                            onClick = null,
+                        )
+                    },
+                    content = {
+                        Text(
+                            text = stringResource(R.string.pairing_enter_manual_option),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                )
             }
+        }
+
+        if (discoveredPeers.isEmpty() || useManualAddress) {
+            OutlinedTextField(
+                value = manualAddressInput,
+                onValueChange = onManualAddressChange,
+                label = { Text(text = stringResource(R.string.pairing_enter_address_label)) },
+                placeholder = { Text(text = stringResource(R.string.pairing_enter_address_placeholder)) },
+                singleLine = true,
+                enabled = !isPairing,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Uri,
+                    imeAction = ImeAction.Next,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { focusState ->
+                        if (focusState.isFocused) {
+                            onManualAddressFocus()
+                        }
+                    },
+            )
         }
 
         OutlinedTextField(
@@ -525,7 +820,10 @@ private fun EnterCodeContent(
             label = { Text(text = stringResource(R.string.pairing_enter_pin_label)) },
             singleLine = true,
             enabled = !isPairing,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Number,
+                imeAction = ImeAction.Done,
+            ),
             modifier = Modifier.fillMaxWidth(),
         )
 
@@ -553,3 +851,55 @@ private fun EnterCodeContent(
 
 private fun formatPin(pin: String): String =
     if (pin.length == 6) "${pin.substring(0, 3)} ${pin.substring(3, 6)}" else pin
+
+private fun resolveLocalIpAddresses(context: Context): List<String> {
+    val activeLanIps = runCatching {
+        val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+            ?: return@runCatching emptyList()
+        val activeNetwork = connectivityManager.activeNetwork ?: return@runCatching emptyList()
+        val caps = connectivityManager.getNetworkCapabilities(activeNetwork)
+            ?: return@runCatching emptyList()
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+            (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+        ) {
+            return@runCatching emptyList()
+        }
+        val props = connectivityManager.getLinkProperties(activeNetwork)
+            ?: return@runCatching emptyList()
+        props.linkAddresses
+            .map { it.address }
+            .filterIsInstance<Inet4Address>()
+            .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
+            .mapNotNull { it.hostAddress }
+    }.getOrDefault(emptyList())
+
+    val interfaceIps = runCatching {
+        NetworkInterface.getNetworkInterfaces()
+            ?.toList()
+            .orEmpty()
+            .filter { it.isUp && !it.isLoopback }
+            .filterNot { iface ->
+                val name = iface.name.orEmpty()
+                name.contains("rmnet", ignoreCase = true) ||
+                    name.startsWith("ccmni", ignoreCase = true) ||
+                    name.startsWith("dummy", ignoreCase = true)
+            }
+            .sortedBy { iface ->
+                val name = iface.name.orEmpty()
+                when {
+                    name.startsWith("wlan", ignoreCase = true) ||
+                        name.startsWith("ap", ignoreCase = true) -> 0
+                    name.startsWith("eth", ignoreCase = true) ||
+                        name.startsWith("en", ignoreCase = true) -> 1
+                    else -> 2
+                }
+            }
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
+            .mapNotNull { it.hostAddress }
+    }.getOrDefault(emptyList())
+
+    return (activeLanIps + interfaceIps).distinct()
+}

@@ -37,6 +37,9 @@
     <string name="pairing_mode_enter_code">Enter code</string>
     <string name="pairing_show_waiting">On your other device, choose Enter code and type this PIN.</string>
     <string name="pairing_show_device_name">Advertising as %1$s</string>
+    <string name="pairing_show_addresses_label">Address</string>
+    <string name="pairing_action_copy_address">Copy %1$s</string>
+    <string name="pairing_show_port">Port: %1$d</string>
     <plurals name="pairing_show_attempts_left">
         <item quantity="one">%1$d attempt remaining</item>
         <item quantity="other">%1$d attempts remaining</item>
@@ -45,6 +48,9 @@
     <string name="pairing_action_new_code">New code</string>
     <string name="pairing_action_close">Close</string>
     <string name="pairing_enter_searching">Searching Wi-Fi for devices showing a code…</string>
+    <string name="pairing_enter_manual_option">Enter address manually</string>
+    <string name="pairing_enter_address_label">Host address</string>
+    <string name="pairing_enter_address_placeholder">192.168.1.10:43215</string>
     <string name="pairing_enter_pin_label">6-digit code</string>
     <string name="pairing_action_connect_pair">Pair</string>
     <string name="pairing_status_pairing">Exchanging keys…</string>

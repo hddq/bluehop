@@ -4,14 +4,19 @@ import kotlinx.coroutines.runBlocking
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
+import org.hddq.bluehop.server.ManualPairingTarget
 import org.hddq.bluehop.server.PairingClient
 import org.hddq.bluehop.server.PairingSessionServer
 import org.hddq.bluehop.server.PairingSessionState
+import org.hddq.bluehop.server.parseManualPairingAddress
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.InetAddress
+import java.net.ServerSocket
+import kotlin.concurrent.thread
 
 class PairingFlowTest {
 
@@ -232,5 +237,192 @@ class PairingFlowTest {
         } finally {
             server.stop()
         }
+    }
+
+    @Test
+    fun parseManualPairingAddressParsesValidHostsAndPorts() {
+        assertEquals(
+            ManualPairingTarget("192.168.1.42", 43215),
+            parseManualPairingAddress("192.168.1.42:43215").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("192.168.1.42", 43215),
+            parseManualPairingAddress(" 192.168.1.42:43215 ").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("laptop.local", 9000),
+            parseManualPairingAddress("http://laptop.local:9000/").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("::1", 8765),
+            parseManualPairingAddress("[::1]:8765").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("2001:db8::1", 43215),
+            parseManualPairingAddress("[2001:db8::1]:43215").getOrThrow(),
+        )
+    }
+
+    @Test
+    fun parseManualPairingAddressRejectsInvalidInputs() {
+        val invalidInputs = listOf(
+            "",
+            "   ",
+            "192.168.1.42",
+            "http://laptop.local/",
+            "[2001:db8::1]",
+            "2001:db8::1",
+            "https://192.168.1.42:8765",
+            "192.168.1.42:",
+            ":8765",
+            "192.168.1.42:0",
+            "192.168.1.42:65536",
+            "192.168.1.42:abc",
+            "192.168.1.42/pair",
+            "192.168.1.42?a=b",
+            "user@192.168.1.42:8765",
+            "192.168.1.42 8765",
+            "[::1",
+            "[::1]extra",
+        )
+        for (input in invalidInputs) {
+            assertTrue("Expected '$input' to fail", parseManualPairingAddress(input).isFailure)
+        }
+    }
+
+    @Test
+    fun pairingWithManuallyEnteredAddressSucceeds() = runBlocking {
+        var responderPairedPeer: PairedPeer? = null
+        val server = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = { peer -> responderPairedPeer = peer },
+        )
+
+        val port = server.start()
+        try {
+            val waiting = server.state.value as PairingSessionState.WaitingForPeer
+            val target = parseManualPairingAddress("127.0.0.1:$port").getOrThrow()
+            val client = PairingClient()
+            val result = client.pairWithHost(
+                host = target.host,
+                port = target.port,
+                pin = waiting.pin,
+                localIdentity = requesterIdentity,
+            )
+            assertTrue("Pairing should succeed: ${result.exceptionOrNull()}", result.isSuccess)
+            assertArrayEquals(responderPairedPeer!!.psk, result.getOrThrow().psk)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun pairingClientRejectsOversizedResponseBodies() = runBlocking {
+        for (statusLine in listOf("200 OK", "500 Internal Server Error")) {
+            ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { serverSocket ->
+                val serverThread = thread(isDaemon = true) {
+                    runCatching {
+                        serverSocket.accept().use { clientSocket ->
+                            clientSocket.soTimeout = 2_000
+                            val reader = clientSocket.getInputStream().bufferedReader(Charsets.US_ASCII)
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (line.isEmpty()) break
+                            }
+                            val payloadSize = PairingClient.MAX_RESPONSE_BYTES + 1
+                            val header = (
+                                "HTTP/1.1 $statusLine\r\n" +
+                                    "Content-Type: application/json\r\n" +
+                                    "Content-Length: $payloadSize\r\n" +
+                                    "Connection: close\r\n\r\n"
+                                ).toByteArray(Charsets.US_ASCII)
+                            val out = clientSocket.getOutputStream()
+                            out.write(header)
+                            out.write(ByteArray(payloadSize) { 'a'.code.toByte() })
+                            out.flush()
+                            clientSocket.shutdownOutput()
+                            while (reader.read() != -1) {
+                                // Wait for client to close cleanly before closing server socket
+                            }
+                        }
+                    }
+                }
+                val result = PairingClient().pairWithHost(
+                    host = "127.0.0.1",
+                    port = serverSocket.localPort,
+                    pin = "123456",
+                    localIdentity = requesterIdentity,
+                )
+                serverThread.join(2_000)
+                assertTrue("Expected failure for $statusLine", result.isFailure)
+                val message = result.exceptionOrNull()?.message.orEmpty()
+                assertTrue(
+                    "Expected size limit message for $statusLine, got: $message",
+                    "${PairingClient.MAX_RESPONSE_BYTES}" in message,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun pairingClientEnforcesOverallRequestDeadline() = runBlocking {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { serverSocket ->
+            val serverThread = thread(isDaemon = true) {
+                runCatching {
+                    serverSocket.accept().use { clientSocket ->
+                        clientSocket.soTimeout = 2_000
+                        val reader = clientSocket.getInputStream().bufferedReader(Charsets.US_ASCII)
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                        }
+                        val out = clientSocket.getOutputStream()
+                        out.write(
+                            (
+                                "HTTP/1.1 200 OK\r\n" +
+                                    "Content-Type: application/json\r\n" +
+                                    "Content-Length: 100\r\n" +
+                                    "Connection: close\r\n\r\n"
+                                ).toByteArray(Charsets.US_ASCII),
+                        )
+                        out.flush()
+                        repeat(40) {
+                            Thread.sleep(50)
+                            out.write('{'.code)
+                            out.flush()
+                        }
+                    }
+                }
+            }
+            val startNanos = System.nanoTime()
+            val result = PairingClient(
+                connectTimeoutMs = 1_000,
+                readTimeoutMs = 2_000,
+                totalTimeoutMs = 250,
+            ).pairWithHost(
+                host = "127.0.0.1",
+                port = serverSocket.localPort,
+                pin = "123456",
+                localIdentity = requesterIdentity,
+            )
+            val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L
+            serverThread.join(2_000)
+            assertTrue("Expected timeout failure, got $result", result.isFailure)
+            assertTrue(
+                "Expected SocketTimeoutException, got ${result.exceptionOrNull()}",
+                result.exceptionOrNull() is java.net.SocketTimeoutException,
+            )
+            assertTrue("Expected deadline to abort quickly, took ${elapsedMs}ms", elapsedMs < 1_500L)
+        }
+    }
+
+    @Test
+    fun formatHostPortFormatsIpv4HostnameAndIpv6() {
+        assertEquals("192.168.1.42:43215", PairingClient.formatHostPort("192.168.1.42", 43215))
+        assertEquals("laptop.local:8765", PairingClient.formatHostPort("laptop.local", 8765))
+        assertEquals("[::1]:8765", PairingClient.formatHostPort("::1", 8765))
+        assertEquals("[2001:db8::1]:43215", PairingClient.formatHostPort("[2001:db8::1]", 43215))
     }
 }
