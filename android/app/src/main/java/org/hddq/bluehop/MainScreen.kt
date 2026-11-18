@@ -39,7 +39,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -139,7 +138,6 @@ fun MainRoute(
     }
     val jobHolder = remember {
         object {
-            var debugJob: Job? = null
             var hopJob: Job? = null
         }
     }
@@ -152,8 +150,6 @@ fun MainRoute(
     val deviceStates by stateObserver.deviceStates.collectAsStateWithLifecycle()
     var localIdentity by remember { mutableStateOf<LocalDeviceIdentity?>(null) }
     var isScreenResumed by remember { mutableStateOf(false) }
-    var debugTargetDevice by remember { mutableStateOf<SelectedBluetoothDevice?>(null) }
-    var debugControlStatus by remember { mutableStateOf<String?>(null) }
     var hopStatusByAddress by remember { mutableStateOf<Map<String, HopUiStatus>>(emptyMap()) }
     var showPairingDialog by rememberSaveable { mutableStateOf(false) }
 
@@ -245,7 +241,6 @@ fun MainRoute(
     DisposableEffect(stateObserver, peerDiscovery) {
         stateObserver.start()
         onDispose {
-            jobHolder.debugJob?.cancel()
             jobHolder.hopJob?.cancel()
             peerDiscovery.shutdown()
             stateObserver.stop()
@@ -306,13 +301,6 @@ fun MainRoute(
         ),
     )
 
-    val waitingAudioProfileText = stringResource(R.string.debug_waiting_audio_profile)
-    val audioProfileConnectedText = stringResource(R.string.debug_audio_profile_connected)
-    val audioProfileDisconnectedText = stringResource(R.string.debug_audio_profile_disconnected)
-    val audioProfileTimeoutText = stringResource(R.string.debug_audio_profile_timeout)
-
-    val activeDebugDevice = debugTargetDevice ?: managedDevices.firstOrNull()
-
     MainScreen(
         permissions = permissions,
         managedAddresses = managedAddresses,
@@ -331,7 +319,6 @@ fun MainRoute(
         },
         onDeviceClick = { device ->
             val key = device.address.uppercase(Locale.ROOT)
-            debugTargetDevice = SelectedBluetoothDevice(name = device.name, address = key)
             if (hopStatusByAddress[key] is HopUiStatus.InProgress) {
                 return@MainScreen
             }
@@ -394,7 +381,6 @@ fun MainRoute(
                 name = device.name,
                 address = device.address.uppercase(Locale.ROOT),
             )
-            debugTargetDevice = normalized
             val nextAddresses = if (managed) {
                 managedAddresses + normalized.address
             } else {
@@ -425,62 +411,6 @@ fun MainRoute(
         modifier = modifier,
         deviceStates = deviceStates,
         hopStatusByAddress = hopStatusByAddress,
-        hasDebugTarget = activeDebugDevice != null,
-        debugControlStatus = debugControlStatus,
-        onConnectClick = {
-            activeDebugDevice?.let { device ->
-                jobHolder.debugJob?.cancel()
-                val result = bluetoothController.connect(device.address)
-                val confirmation = stateObserver.profileConfirmation
-                val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
-                    ?.devices
-                    ?.firstOrNull { it.address.equals(device.address, ignoreCase = true) }
-                    ?.isAudioDevice == true
-                if (result.isSuccess && isAudioDevice && confirmation != null) {
-                    debugControlStatus = "${result.message} • $waitingAudioProfileText"
-                    jobHolder.debugJob = coroutineScope.launch {
-                        val confirmed = confirmation.awaitConfirmation(
-                            address = device.address,
-                            targetConnected = true,
-                        )
-                        debugControlStatus = if (confirmed) {
-                            "${result.message} • $audioProfileConnectedText"
-                        } else {
-                            "${result.message} • $audioProfileTimeoutText"
-                        }
-                    }
-                } else {
-                    debugControlStatus = result.message
-                }
-            }
-        },
-        onDisconnectClick = {
-            activeDebugDevice?.let { device ->
-                jobHolder.debugJob?.cancel()
-                val result = bluetoothController.disconnect(device.address)
-                val confirmation = stateObserver.profileConfirmation
-                val isAudioDevice = (bondedDevicesState as? BondedDevicesState.Ready)
-                    ?.devices
-                    ?.firstOrNull { it.address.equals(device.address, ignoreCase = true) }
-                    ?.isAudioDevice == true
-                if (result.isSuccess && isAudioDevice && confirmation != null) {
-                    debugControlStatus = "${result.message} • $waitingAudioProfileText"
-                    jobHolder.debugJob = coroutineScope.launch {
-                        val confirmed = confirmation.awaitConfirmation(
-                            address = device.address,
-                            targetConnected = false,
-                        )
-                        debugControlStatus = if (confirmed) {
-                            "${result.message} • $audioProfileDisconnectedText"
-                        } else {
-                            "${result.message} • $audioProfileTimeoutText"
-                        }
-                    }
-                } else {
-                    debugControlStatus = result.message
-                }
-            }
-        },
         pairedPeers = pairedPeers,
         canPairHosts = isLocalNetworkGranted,
         onPairHostClick = {
@@ -537,10 +467,6 @@ fun MainScreen(
     modifier: Modifier = Modifier,
     deviceStates: Map<String, DeviceState> = emptyMap(),
     hopStatusByAddress: Map<String, HopUiStatus> = emptyMap(),
-    hasDebugTarget: Boolean = false,
-    debugControlStatus: String? = null,
-    onConnectClick: () -> Unit = {},
-    onDisconnectClick: () -> Unit = {},
     pairedPeers: List<PairedPeerSummary> = emptyList(),
     canPairHosts: Boolean = true,
     onPairHostClick: () -> Unit = {},
@@ -770,21 +696,6 @@ fun MainScreen(
                             count = pairedPeers.size,
                             onRemoveClick = { onRemovePairedPeerClick(peer) },
                             modifier = Modifier.animateItem(),
-                        )
-                    }
-                }
-
-                if (BuildConfig.DEBUG) {
-                    item(key = "debug_controls_spacer") {
-                        Spacer(modifier = Modifier.height(14.dp))
-                    }
-
-                    item(key = "debug_controls") {
-                        DebugBluetoothControls(
-                            enabled = hasDebugTarget,
-                            statusMessage = debugControlStatus,
-                            onConnectClick = onConnectClick,
-                            onDisconnectClick = onDisconnectClick,
                         )
                     }
                 }
@@ -1209,51 +1120,6 @@ private fun PairedHostListItem(
             )
         },
     )
-}
-
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
-@Composable
-private fun DebugBluetoothControls(
-    enabled: Boolean,
-    statusMessage: String?,
-    onConnectClick: () -> Unit,
-    onDisconnectClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Column(
-        modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Button(
-                onClick = onConnectClick,
-                enabled = enabled,
-                shapes = ButtonDefaults.shapes(),
-                modifier = Modifier.weight(1f),
-            ) {
-                Text(text = stringResource(R.string.debug_action_connect))
-            }
-            FilledTonalButton(
-                onClick = onDisconnectClick,
-                enabled = enabled,
-                shapes = ButtonDefaults.shapes(),
-                modifier = Modifier.weight(1f),
-            ) {
-                Text(text = stringResource(R.string.debug_action_disconnect))
-            }
-        }
-        if (statusMessage != null) {
-            Text(
-                text = statusMessage,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 4.dp),
-            )
-        }
-    }
 }
 
 private fun Context.hasPermission(permission: String): Boolean =

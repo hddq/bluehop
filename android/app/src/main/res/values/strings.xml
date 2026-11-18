@@ -25,12 +25,6 @@
     <string name="bluetooth_state_connected_bredr">Connected (BR/EDR)</string>
     <string name="bluetooth_state_connected_le">Connected (LE)</string>
     <string name="bluetooth_state_disconnected">Disconnected</string>
-    <string name="debug_action_connect">Connect</string>
-    <string name="debug_action_disconnect">Disconnect</string>
-    <string name="debug_waiting_audio_profile">Waiting for audio profile…</string>
-    <string name="debug_audio_profile_connected">Audio profile connected</string>
-    <string name="debug_audio_profile_disconnected">Audio profile disconnected</string>
-    <string name="debug_audio_profile_timeout">Audio profile confirmation timed out</string>
 
     <string name="paired_hosts_section_title">Paired hosts</string>
     <string name="paired_hosts_action_pair">Pair</string>
