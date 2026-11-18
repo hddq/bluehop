@@ -183,10 +183,8 @@ class GrabClient(
         }
     }
 
-    internal fun formatBaseUrl(host: String, port: Int): String {
-        val bracketedHost = if (':' in host && !host.startsWith("[")) "[$host]" else host
-        return "http://$bracketedHost:$port"
-    }
+    internal fun formatBaseUrl(host: String, port: Int): String =
+        PairingClient.formatBaseUrl(host, port)
 
     private data class SimpleHttpResponse(
         val statusCode: Int,

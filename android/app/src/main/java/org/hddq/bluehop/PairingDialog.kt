@@ -8,6 +8,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.system.OsConstants
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -82,8 +83,11 @@ import org.hddq.bluehop.server.NsdPeerDiscovery
 import org.hddq.bluehop.server.PairingClient
 import org.hddq.bluehop.server.PairingSessionServer
 import org.hddq.bluehop.server.PairingSessionState
+import org.hddq.bluehop.server.filterAndSortLocalIpAddresses
+import org.hddq.bluehop.server.isUsableLocalIpAddress
 import org.hddq.bluehop.server.parseManualPairingAddress
-import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 
 enum class PairingMode {
@@ -718,7 +722,7 @@ private fun EnterCodeContent(
                         },
                         supportingContent = {
                             Text(
-                                text = "${peer.host}:${peer.port}",
+                                text = PairingClient.formatHostPort(peer.host, peer.port),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -852,7 +856,8 @@ private fun EnterCodeContent(
 private fun formatPin(pin: String): String =
     if (pin.length == 6) "${pin.substring(0, 3)} ${pin.substring(3, 6)}" else pin
 
-private fun resolveLocalIpAddresses(context: Context): List<String> {
+internal fun resolveLocalIpAddresses(context: Context): List<String> {
+    val excludedLinkAddresses = mutableSetOf<InetAddress>()
     val activeLanIps = runCatching {
         val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
             ?: return@runCatching emptyList()
@@ -867,11 +872,31 @@ private fun resolveLocalIpAddresses(context: Context): List<String> {
         }
         val props = connectivityManager.getLinkProperties(activeNetwork)
             ?: return@runCatching emptyList()
-        props.linkAddresses
-            .map { it.address }
-            .filterIsInstance<Inet4Address>()
-            .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
-            .mapNotNull { it.hostAddress }
+        val invalidFlags = OsConstants.IFA_F_DEPRECATED or
+            OsConstants.IFA_F_TENTATIVE or
+            OsConstants.IFA_F_DADFAILED
+        val nonTemporary = mutableListOf<InetAddress>()
+        val temporaryFallback = mutableListOf<InetAddress>()
+        for (linkAddress in props.linkAddresses) {
+            val address = linkAddress.address
+            val flags = linkAddress.flags
+            if ((flags and invalidFlags) != 0) {
+                excludedLinkAddresses += address
+            } else if (address is Inet6Address && (flags and OsConstants.IFA_F_TEMPORARY) != 0) {
+                excludedLinkAddresses += address
+                temporaryFallback += address
+            } else {
+                nonTemporary += address
+            }
+        }
+        val hasStableIpv6 = nonTemporary.any { it is Inet6Address && isUsableLocalIpAddress(it) }
+        val selected = if (hasStableIpv6) {
+            nonTemporary
+        } else {
+            excludedLinkAddresses.removeAll(temporaryFallback.toSet())
+            nonTemporary + temporaryFallback
+        }
+        filterAndSortLocalIpAddresses(selected, excludedLinkAddresses)
     }.getOrDefault(emptyList())
 
     val interfaceIps = runCatching {
@@ -895,10 +920,12 @@ private fun resolveLocalIpAddresses(context: Context): List<String> {
                     else -> 2
                 }
             }
-            .flatMap { it.inetAddresses.toList() }
-            .filterIsInstance<Inet4Address>()
-            .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
-            .mapNotNull { it.hostAddress }
+            .flatMap { iface ->
+                filterAndSortLocalIpAddresses(
+                    addresses = iface.inetAddresses.toList(),
+                    excludedAddresses = excludedLinkAddresses,
+                )
+            }
     }.getOrDefault(emptyList())
 
     return (activeLanIps + interfaceIps).distinct()

@@ -83,20 +83,18 @@ class PairingSessionServer(
             activeSession = createSession()
         }
 
-        val started = embeddedServer(
-            factory = CIO,
-            port = preferredPort,
-            host = host,
-        ) {
-            routing {
-                get("/pair/info") {
-                    handlePairInfo(call)
-                }
-                post("/pair") {
-                    handlePair(call)
-                }
+        val (started, boundHost) = try {
+            startEngine(host) to host
+        } catch (error: Throwable) {
+            if (host == HolderHttpServer.DEFAULT_HOST && isIpv6UnavailableError(error)) {
+                onLog(
+                    "Dual-stack IPv6 unavailable on $host, falling back to ${HolderHttpServer.IPV4_FALLBACK_HOST}",
+                )
+                startEngine(HolderHttpServer.IPV4_FALLBACK_HOST) to HolderHttpServer.IPV4_FALLBACK_HOST
+            } else {
+                throw error
             }
-        }.start(wait = false)
+        }
 
         server = started
         boundPort = started.engine.resolvedConnectors().first().port
@@ -108,8 +106,33 @@ class PairingSessionServer(
                 attemptsRemaining = session.attemptsRemaining,
             )
         }
-        onLog("Pairing server listening on $host:$boundPort")
+        onLog("Pairing server listening on ${PairingClient.formatHostPort(boundHost, boundPort)}")
         return boundPort
+    }
+
+    private fun startEngine(
+        bindHost: String,
+    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
+        val candidate = embeddedServer(
+            factory = CIO,
+            port = preferredPort,
+            host = bindHost,
+        ) {
+            routing {
+                get("/pair/info") {
+                    handlePairInfo(call)
+                }
+                post("/pair") {
+                    handlePair(call)
+                }
+            }
+        }
+        return try {
+            candidate.start(wait = false)
+        } catch (error: Throwable) {
+            runCatching { candidate.stop(gracePeriodMillis = 0L, timeoutMillis = 0L) }
+            throw error
+        }
     }
 
     suspend fun regenerateSession() {

@@ -28,10 +28,10 @@ import org.hddq.bluehop.BuildConfig
 import org.hddq.bluehop.data.SelectedDeviceRepository
 import org.hddq.bluehop.protocol.KeystorePskStore
 import org.hddq.bluehop.protocol.PairedPeersRepository
+import org.hddq.bluehop.resolveLocalIpAddresses
 import org.hddq.bluehop.server.HolderHttpServer
 import org.hddq.bluehop.server.NsdAdvertiser
-import java.net.Inet4Address
-import java.net.NetworkInterface
+import org.hddq.bluehop.server.PairingClient
 import java.util.Locale
 
 private const val TAG = "BlueHopPresence"
@@ -179,7 +179,7 @@ class BlueHopCompanionService : CompanionDeviceService() {
                 )
                 holderActive = true
                 advertisedAddresses = connected
-                val ips = localIpv4Addresses().joinToString().ifEmpty { "none" }
+                val ips = localIpAddresses(port).joinToString().ifEmpty { "none" }
                 Log.i(
                     TAG,
                     "Holder active on port=$port ips=[$ips] id=${identity.deviceId} devices=${connected.joinToString()}",
@@ -242,15 +242,10 @@ class BlueHopCompanionService : CompanionDeviceService() {
         }
     }
 
-    private fun localIpv4Addresses(): List<String> = runCatching {
-        NetworkInterface.getNetworkInterfaces()
-            ?.toList()
-            .orEmpty()
-            .filter { it.isUp && !it.isLoopback }
-            .flatMap { it.inetAddresses.toList() }
-            .filterIsInstance<Inet4Address>()
-            .mapNotNull { it.hostAddress }
-    }.getOrDefault(emptyList())
+    private fun localIpAddresses(port: Int): List<String> =
+        resolveLocalIpAddresses(this).map { host ->
+            PairingClient.formatHostPort(host, port)
+        }
 }
 
 internal data class AssociationEntry(
