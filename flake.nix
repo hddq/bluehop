@@ -33,6 +33,7 @@
           gradle
           android-tools
           androidSdk
+          go_1_27
           git
         ];
 
