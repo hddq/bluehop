@@ -1,0 +1,230 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version_code: ${{ steps.version.outputs.version_code }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate tag against Gradle version metadata
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          GRADLE_FILE=android/app/build.gradle.kts
+
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Tag '$TAG' must look like vX.Y.Z or vX.Y.Z-<pre-release> (e.g. v0.1.0)."
+            exit 1
+          fi
+
+          VERSION_NAME=$(sed -n -E 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' "$GRADLE_FILE")
+          VERSION_CODE=$(sed -n -E 's/^[[:space:]]*versionCode = ([0-9]+).*/\1/p' "$GRADLE_FILE")
+          echo "Tag: $TAG | versionName: $VERSION_NAME | versionCode: $VERSION_CODE"
+
+          if [ "v${VERSION_NAME}" != "$TAG" ]; then
+            echo "::error::Tag '$TAG' does not match versionName '$VERSION_NAME' in $GRADLE_FILE (expected tag 'v$VERSION_NAME')."
+            exit 1
+          fi
+          if [ -z "$VERSION_CODE" ]; then
+            echo "::error::Could not parse versionCode from $GRADLE_FILE."
+            exit 1
+          fi
+
+          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
+          if [ ! -f "$CHANGELOG_FILE" ]; then
+            echo "::warning::$CHANGELOG_FILE not found; releasing without a Highlights section."
+          fi
+
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    needs: validate-version
+    runs-on: ubuntu-latest
+    env:
+      JAVA_VERSION: "21"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-root-directory: android
+
+      - name: Run unit tests
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-unit-test-results
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/test-results/
+
+      - name: Validate signing secrets
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_SIGNING_KEYSTORE_BASE64"
+          test -n "$ANDROID_SIGNING_STORE_PASSWORD"
+          test -n "$ANDROID_SIGNING_KEY_ALIAS"
+          test -n "$ANDROID_SIGNING_KEY_PASSWORD"
+
+      - name: Decode keystore
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYSTORE_PATH="$RUNNER_TEMP/android-release-signing.jks"
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          echo "ANDROID_SIGNING_KEYSTORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        working-directory: android
+        env:
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Collect release APKs
+        id: collect_apks
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find android/app/build/outputs/apk -type f -path '*/release/*.apk' | sort)
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "No APK files were produced."
+            exit 1
+          fi
+
+          if find android/app/build/outputs/apk -type f -path '*/release/*unsigned*.apk' | grep -q .; then
+            echo "Unsigned APKs were found in release outputs."
+            find android/app/build/outputs/apk -type f -path '*/release/*unsigned*.apk'
+            exit 1
+          fi
+
+          mkdir -p release-assets
+          for apk in "${apks[@]}"; do
+            filename=$(basename "$apk")
+            cp "$apk" "release-assets/${filename%.apk}-${TAG}.apk"
+          done
+
+          {
+            echo "files<<EOF"
+            find release-assets -type f -name '*.apk' | sort
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum *.apk > SHA256SUMS.txt)
+
+      - name: Collect and compress release mapping
+        run: |
+          set -euo pipefail
+          mapfile -t mappings < <(find android/app/build/outputs/mapping/release -type f -name 'mapping.txt')
+          if [ ${#mappings[@]} -eq 0 ]; then
+            echo "No mapping.txt file found."
+            exit 1
+          fi
+          echo "Found mapping file: ${mappings[0]}"
+          gzip -9 -n -c "${mappings[0]}" > release-assets/mapping.txt.gz
+
+      - name: Prepare release notes
+        id: changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION_CODE: ${{ needs.validate-version.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          RELEASE_BODY_FILE="$RUNNER_TEMP/release-body.md"
+          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
+
+          BASE_TAG="${TAG%%-*}"
+          STABLE_TAGS=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName')
+          PREV_STABLE_TAG=$(printf '%s\n' "$STABLE_TAGS" "$BASE_TAG" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -u -V \
+            | awk -v base="$BASE_TAG" '$0 == base { exit } { last = $0 } END { print last }')
+
+          notes_args=(-f tag_name="$TAG")
+          if [ -n "$PREV_STABLE_TAG" ]; then
+            echo "Generating release notes for $TAG against previous stable release $PREV_STABLE_TAG"
+            notes_args+=(-f previous_tag_name="$PREV_STABLE_TAG")
+          else
+            echo "::warning::No previous stable release found; GitHub will pick the comparison base."
+          fi
+          GENERATED_NOTES=$(gh api "repos/${{ github.repository }}/releases/generate-notes" "${notes_args[@]}" --jq '.body')
+
+          {
+            if [ -f "$CHANGELOG_FILE" ]; then
+              echo "Using changelog: $CHANGELOG_FILE" >&2
+              echo "## Highlights"
+              echo ""
+              cat "$CHANGELOG_FILE"
+              printf '\n\n'
+            fi
+            printf '%s\n' "$GENERATED_NOTES"
+          } > "$RELEASE_BODY_FILE"
+          echo "path=$RELEASE_BODY_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: BlueHop ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: false
+          body_path: ${{ steps.changelog.outputs.path }}
+          files: |
+            ${{ steps.collect_apks.outputs.files }}
+            release-assets/SHA256SUMS.txt
+            release-assets/mapping.txt.gz
+
+      - name: Remove signing keystore
+        if: always()
+        run: |
+          if [ -n "${ANDROID_SIGNING_KEYSTORE_FILE:-}" ] && [ -f "$ANDROID_SIGNING_KEYSTORE_FILE" ]; then
+            shred -u "$ANDROID_SIGNING_KEYSTORE_FILE" || rm -f "$ANDROID_SIGNING_KEYSTORE_FILE"
+          fi

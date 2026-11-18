@@ -1,0 +1,68 @@
+name: Android Debug CI
+
+on:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "android/**"
+      - ".github/workflows/android-debug.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-debug.yml"
+
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    env:
+      JAVA_VERSION: "21"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-root-directory: android
+
+      - name: Run unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-results
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/test-results/
+
+      - name: Run lint
+        run: ./gradlew --no-daemon lintDebug
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: bluehop-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
