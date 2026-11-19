@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hddq/bluehop/linux/internal/bluez"
 	"github.com/hddq/bluehop/linux/internal/pairing"
 	"github.com/hddq/bluehop/linux/internal/peers"
 	"github.com/hddq/bluehop/linux/internal/protocol"
@@ -26,6 +27,18 @@ import (
 // version can be overridden at link time via:
 // go build -ldflags "-X main.version=v0.1.0" -o build/bluehop ./cmd/bluehop
 var version = "dev"
+
+type cliDeps struct {
+	openBluez func() (bluez.Controller, error)
+}
+
+func defaultDeps() cliDeps {
+	return cliDeps{
+		openBluez: func() (bluez.Controller, error) {
+			return bluez.ConnectSystem()
+		},
+	}
+}
 
 func main() {
 	os.Exit(runWithIO(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -36,15 +49,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runWithDeps(args, stdin, stdout, stderr, defaultDeps())
+}
+
+func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliDeps) int {
 	fs := flag.NewFlagSet("bluehop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: bluehop <command> [options]")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Commands:")
-		fmt.Fprintln(stderr, "  pair      Pair with another BlueHop host via ECDH + 6-digit SAS")
-		fmt.Fprintln(stderr, "  peers     List or remove paired hosts")
-		fmt.Fprintln(stderr, "  version   Print the bluehop CLI version")
+		fmt.Fprintln(stderr, "  devices     List paired Bluetooth devices via BlueZ")
+		fmt.Fprintln(stderr, "  connect     Connect to a paired Bluetooth device")
+		fmt.Fprintln(stderr, "  disconnect  Disconnect a paired Bluetooth device")
+		fmt.Fprintln(stderr, "  pair        Pair with another BlueHop host via ECDH + 6-digit SAS")
+		fmt.Fprintln(stderr, "  peers       List or remove paired hosts")
+		fmt.Fprintln(stderr, "  version     Print the bluehop CLI version")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
@@ -74,6 +94,12 @@ func runWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "devices":
+		return runDevices(fs.Args()[1:], stdout, stderr, deps)
+	case "connect":
+		return runBluetoothAction("connect", fs.Args()[1:], stdout, stderr, deps)
+	case "disconnect":
+		return runBluetoothAction("disconnect", fs.Args()[1:], stdout, stderr, deps)
 	case "pair":
 		return runPair(fs.Args()[1:], stdin, stdout, stderr)
 	case "peers":
@@ -416,6 +442,132 @@ func runPeers(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 2
 	}
+}
+
+func runDevices(args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	fs := flag.NewFlagSet("devices", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	timeoutFlag := fs.Duration("timeout", 5*time.Second, "BlueZ D-Bus timeout")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  bluehop devices [options]")
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Options:")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return 2
+	}
+
+	ctrl, err := deps.openBluez()
+	if err != nil {
+		fmt.Fprintf(stderr, "open BlueZ controller: %v\n", err)
+		return 1
+	}
+	defer ctrl.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *timeoutFlag > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeoutFlag)
+		defer cancel()
+	}
+
+	devices, err := ctrl.ListDevices(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "list Bluetooth devices: %v\n", err)
+		return 1
+	}
+	if len(devices) == 0 {
+		fmt.Fprintln(stdout, "No paired Bluetooth devices.")
+		return 0
+	}
+	for _, d := range devices {
+		status := "disconnected"
+		if d.Connected {
+			status = "connected"
+		}
+		fmt.Fprintf(stdout, "%s\t%s\t%s\n", d.Address, status, d.DisplayName())
+	}
+	return 0
+}
+
+func runBluetoothAction(action string, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	defaultTimeout := 30 * time.Second
+	if action == "disconnect" {
+		defaultTimeout = 15 * time.Second
+	}
+
+	fs := flag.NewFlagSet(action, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	timeoutFlag := fs.Duration("timeout", defaultTimeout, "BlueZ D-Bus operation timeout")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintf(stderr, "  bluehop %s [options] <mac-or-name>\n", action)
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Options:")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return 2
+	}
+
+	ctrl, err := deps.openBluez()
+	if err != nil {
+		fmt.Fprintf(stderr, "open BlueZ controller: %v\n", err)
+		return 1
+	}
+	defer ctrl.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *timeoutFlag > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeoutFlag)
+		defer cancel()
+	}
+
+	target := fs.Arg(0)
+	if action == "connect" {
+		dev, err := ctrl.Connect(ctx, target)
+		if errors.Is(err, bluez.ErrAlreadyConnected) {
+			fmt.Fprintf(stdout, "%s (%s) is already connected\n", dev.DisplayName(), dev.Address)
+			return 0
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Connected to %s (%s)\n", dev.DisplayName(), dev.Address)
+		return 0
+	}
+
+	dev, err := ctrl.Disconnect(ctx, target)
+	if errors.Is(err, bluez.ErrNotConnected) {
+		fmt.Fprintf(stdout, "%s (%s) is already disconnected\n", dev.DisplayName(), dev.Address)
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Disconnected from %s (%s)\n", dev.DisplayName(), dev.Address)
+	return 0
 }
 
 func resolveStorePath(override string) (string, error) {
