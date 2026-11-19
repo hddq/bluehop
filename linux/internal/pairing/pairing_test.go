@@ -171,6 +171,71 @@ func TestPairingRejectDoesNotPersist(t *testing.T) {
 	}
 }
 
+func TestClientCancelNotifiesServer(t *testing.T) {
+	dir := t.TempDir()
+	serverStore := peers.NewStore(filepath.Join(dir, "server.json"))
+	clientStore := peers.NewStore(filepath.Join(dir, "client.json"))
+
+	pendingCh := make(chan PendingSession, 1)
+	cancelledCh := make(chan string, 1)
+	srv := NewServer(ServerConfig{
+		Identity:     peers.Identity{DeviceID: "server-1", DeviceName: "Server"},
+		OnPeerPaired: serverStore.UpsertPeer,
+		OnPendingSession: func(p PendingSession) {
+			pendingCh <- p
+		},
+		OnCancelled: func(sessionID string) {
+			cancelledCh <- sessionID
+		},
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	client := NewClient(ClientConfig{
+		PollInterval: 10 * time.Millisecond,
+		OnPeerPaired: clientStore.UpsertPeer,
+	})
+
+	sasCh := make(chan SASChallenge, 1)
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_, err := client.PairWithHost(
+			ctx,
+			httpSrv.URL,
+			peers.Identity{DeviceID: "client-1", DeviceName: "Client"},
+			func(ch SASChallenge) { sasCh <- ch },
+		)
+		errCh <- err
+	}()
+
+	pending := <-pendingCh
+	<-sasCh
+	cancel()
+
+	select {
+	case cancelledID := <-cancelledCh:
+		if cancelledID != pending.SessionID {
+			t.Fatalf("cancelled session = %q, want %q", cancelledID, pending.SessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server cancellation callback")
+	}
+
+	if err := srv.Approve(pending.SessionID); err == nil {
+		t.Fatal("expected Approve after client cancel to fail")
+	}
+	if err := <-errCh; err == nil {
+		t.Fatal("expected cancelled client to return error")
+	}
+	if list, _ := serverStore.ListPeers(); len(list) != 0 {
+		t.Fatalf("server persisted cancelled peer")
+	}
+	if list, _ := clientStore.ListPeers(); len(list) != 0 {
+		t.Fatalf("client persisted cancelled peer")
+	}
+}
+
 func TestPairingTTLExpiryDoesNotPersist(t *testing.T) {
 	var nowUnix atomic.Int64
 	nowUnix.Store(1700000000)

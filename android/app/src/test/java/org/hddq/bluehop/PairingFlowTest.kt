@@ -1,10 +1,13 @@
 package org.hddq.bluehop
 
 import android.bluetooth.BluetoothStatusCodes
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.hddq.bluehop.bluetooth.BluetoothControlResult
@@ -264,6 +267,106 @@ class PairingFlowTest {
             val success = retryDeferred.await()
             assertTrue(success.isSuccess)
             assertArrayEquals(responderPairedPeer!!.psk, success.getOrThrow().psk)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun clientCancelNotifiesServerAndPreventsAccept() = runBlocking {
+        var responderPairedPeer: PairedPeer? = null
+        val server = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = { peer -> responderPairedPeer = peer },
+        )
+
+        val port = server.start()
+        try {
+            val client = PairingClient(pollIntervalMs = 20L)
+            val sasReady = CompletableDeferred<Unit>()
+            val pairJob = launch {
+                client.pairWithHost(
+                    host = "127.0.0.1",
+                    port = port,
+                    localIdentity = requesterIdentity,
+                    onSasReady = { _, _ -> sasReady.complete(Unit) },
+                )
+            }
+
+            val pending = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            withTimeout(5_000L) { sasReady.await() }
+
+            pairJob.cancelAndJoin()
+
+            val rejected = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.Rejected>().first()
+            }
+            assertTrue(rejected.message.contains(requesterIdentity.deviceName))
+            assertFalse("Server must not accept a session cancelled by client", server.approveSession(pending.sessionId))
+            assertNull(responderPairedPeer)
+
+            server.resetSession()
+            val retryDeferred = async {
+                client.pairWithHost(
+                    host = "127.0.0.1",
+                    port = port,
+                    localIdentity = requesterIdentity,
+                )
+            }
+            val nextPending = withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+            }
+            assertTrue(server.approveSession(nextPending.sessionId))
+            val success = retryDeferred.await()
+            assertTrue(success.isSuccess)
+            assertArrayEquals(responderPairedPeer!!.psk, success.getOrThrow().psk)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun pairingSessionExpiresActivelyWithoutClientPolling(): Unit = runBlocking {
+        val server = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = 0,
+            identityProvider = { responderIdentity },
+            onPeerPaired = {},
+            sessionTtlSeconds = 1L,
+        )
+
+        val port = server.start()
+        try {
+            val clientKeyPair = PairingCrypto.generateEphemeralKeyPair()
+            val startConn = (URI.create("http://127.0.0.1:$port/pair/start").toURL().openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            startConn.outputStream.use {
+                it.write(
+                    ProtocolJson.encodePairStartRequest(
+                        PairStartRequest(
+                            version = PAIRING_PROTOCOL_VERSION,
+                            requesterId = requesterIdentity.deviceId,
+                            requesterName = requesterIdentity.deviceName,
+                            clientPub = PairingCrypto.encodePublicKey(clientKeyPair.public),
+                        ),
+                    ).toByteArray(Charsets.UTF_8),
+                )
+            }
+            assertEquals(200, startConn.responseCode)
+            startConn.disconnect()
+
+            withTimeout(5_000L) {
+                server.state.filterIsInstance<PairingSessionState.PendingConfirmation>().first()
+                server.state.filterIsInstance<PairingSessionState.Expired>().first()
+            }
+            assertTrue(server.state.value is PairingSessionState.Expired)
         } finally {
             server.stop()
         }

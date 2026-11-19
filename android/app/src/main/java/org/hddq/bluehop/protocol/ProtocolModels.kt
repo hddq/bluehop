@@ -109,6 +109,12 @@ data class PairConfirmRequest(
 )
 
 @Serializable
+data class PairCancelRequest(
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
+    val sessionId: String,
+)
+
+@Serializable
 data class PairConfirmResponse(
     @Required val version: Int = PAIRING_PROTOCOL_VERSION,
     val sessionId: String,
@@ -150,6 +156,10 @@ object ProtocolJson {
     fun encodePairConfirmRequest(request: PairConfirmRequest): String = codec.encodeToString(request)
 
     fun decodePairConfirmRequest(json: String): PairConfirmRequest = codec.decodeFromString(json)
+
+    fun encodePairCancelRequest(request: PairCancelRequest): String = codec.encodeToString(request)
+
+    fun decodePairCancelRequest(json: String): PairCancelRequest = codec.decodeFromString(json)
 
     fun encodePairConfirmResponse(response: PairConfirmResponse): String = codec.encodeToString(response)
 

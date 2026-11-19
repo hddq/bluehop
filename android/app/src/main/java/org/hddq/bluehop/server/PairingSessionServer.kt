@@ -13,10 +13,17 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -24,6 +31,7 @@ import kotlinx.serialization.SerializationException
 import org.hddq.bluehop.protocol.HmacSigner
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PAIRING_PROTOCOL_VERSION
+import org.hddq.bluehop.protocol.PairCancelRequest
 import org.hddq.bluehop.protocol.PairConfirmRequest
 import org.hddq.bluehop.protocol.PairConfirmResponse
 import org.hddq.bluehop.protocol.PairErrorResponse
@@ -99,6 +107,8 @@ class PairingSessionServer(
     val state: StateFlow<PairingSessionState> = _state.asStateFlow()
 
     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+    private var serverScope: CoroutineScope? = null
+    private var expiryJob: Job? = null
     private var activeSession: ActivePairingSession? = null
 
     @Volatile
@@ -108,9 +118,12 @@ class PairingSessionServer(
     suspend fun start(): Int = lifecycleMutex.withLock {
         server?.let { return boundPort }
         sessionMutex.withLock {
+            expiryJob?.cancel()
+            expiryJob = null
             activeSession = null
         }
 
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val (started, boundHost) = try {
             startEngine(host) to host
         } catch (error: Throwable) {
@@ -118,12 +131,19 @@ class PairingSessionServer(
                 onLog(
                     "Dual-stack IPv6 unavailable on $host, falling back to ${HolderHttpServer.IPV4_FALLBACK_HOST}",
                 )
-                startEngine(HolderHttpServer.IPV4_FALLBACK_HOST) to HolderHttpServer.IPV4_FALLBACK_HOST
+                runCatching {
+                    startEngine(HolderHttpServer.IPV4_FALLBACK_HOST) to HolderHttpServer.IPV4_FALLBACK_HOST
+                }.getOrElse { fallbackError ->
+                    scope.cancel()
+                    throw fallbackError
+                }
             } else {
+                scope.cancel()
                 throw error
             }
         }
 
+        serverScope = scope
         server = started
         boundPort = started.engine.resolvedConnectors().first().port
         _state.value = PairingSessionState.WaitingForPeer(port = boundPort)
@@ -146,6 +166,9 @@ class PairingSessionServer(
                 get("/pair/status") {
                     handlePairStatus(call)
                 }
+                post("/pair/cancel") {
+                    handlePairCancel(call)
+                }
                 post("/pair/confirm") {
                     handlePairConfirm(call)
                 }
@@ -164,6 +187,8 @@ class PairingSessionServer(
         if (session.sessionId != sessionId || session.completed) return@withLock false
         if (nowEpochSeconds() > session.expiresAtEpochSec) {
             session.status = PairSessionStatus.EXPIRED
+            expiryJob?.cancel()
+            expiryJob = null
             _state.value = PairingSessionState.Expired(port = boundPort)
             return@withLock false
         }
@@ -184,11 +209,15 @@ class PairingSessionServer(
         if (session.sessionId != sessionId || session.completed) return@withLock false
         if (nowEpochSeconds() > session.expiresAtEpochSec) {
             session.status = PairSessionStatus.EXPIRED
+            expiryJob?.cancel()
+            expiryJob = null
             _state.value = PairingSessionState.Expired(port = boundPort)
             return@withLock false
         }
         if (session.status != PairSessionStatus.PENDING) return@withLock false
         session.status = PairSessionStatus.REJECTED
+        expiryJob?.cancel()
+        expiryJob = null
         _state.value = PairingSessionState.Rejected(
             port = boundPort,
             message = "Pairing request rejected",
@@ -199,6 +228,8 @@ class PairingSessionServer(
 
     suspend fun resetSession() {
         sessionMutex.withLock {
+            expiryJob?.cancel()
+            expiryJob = null
             activeSession = null
             if (server != null) {
                 _state.value = PairingSessionState.WaitingForPeer(port = boundPort)
@@ -210,9 +241,14 @@ class PairingSessionServer(
         val current = server ?: return@withLock
         server = null
         boundPort = 0
+        val scope = serverScope
+        serverScope = null
         sessionMutex.withLock {
+            expiryJob?.cancel()
+            expiryJob = null
             activeSession = null
         }
+        scope?.cancel()
         _state.value = PairingSessionState.Idle
         current.stop(gracePeriodMillis = 200L, timeoutMillis = 1_000L)
         onLog("Pairing server stopped")
@@ -298,6 +334,7 @@ class PairingSessionServer(
                 keys = keys,
                 expiresAtEpochSec = expiresAt,
             )
+            scheduleExpiryLocked(sessionId)
             _state.value = PairingSessionState.PendingConfirmation(
                 sessionId = sessionId,
                 requesterId = request.requesterId,
@@ -346,6 +383,8 @@ class PairingSessionServer(
                 (current.status == PairSessionStatus.PENDING || current.status == PairSessionStatus.APPROVED)
             ) {
                 current.status = PairSessionStatus.EXPIRED
+                expiryJob?.cancel()
+                expiryJob = null
                 _state.value = PairingSessionState.Expired(port = boundPort)
             }
             current.status
@@ -367,6 +406,90 @@ class PairingSessionServer(
             contentType = ContentType.Application.Json,
             status = HttpStatusCode.OK,
         )
+    }
+
+    private suspend fun handlePairCancel(call: RoutingCall) {
+        val body = call.receiveText()
+        val request = try {
+            ProtocolJson.decodePairCancelRequest(body)
+        } catch (_: SerializationException) {
+            respondError(call, HttpStatusCode.BadRequest, "Malformed cancellation JSON")
+            return
+        } catch (_: IllegalArgumentException) {
+            respondError(call, HttpStatusCode.BadRequest, "Invalid cancellation payload")
+            return
+        }
+
+        if (request.version != PAIRING_PROTOCOL_VERSION ||
+            !PairingCrypto.isValidSingleLineField(request.sessionId)
+        ) {
+            respondError(call, HttpStatusCode.BadRequest, "Invalid cancellation parameters")
+            return
+        }
+
+        val outcome = sessionMutex.withLock {
+            val session = activeSession
+            if (session == null || session.sessionId != request.sessionId) {
+                return@withLock CancelOutcome.Error(HttpStatusCode.NotFound, "Unknown pairing session")
+            }
+            if (session.completed || session.confirming) {
+                return@withLock CancelOutcome.Error(HttpStatusCode.Conflict, "Pairing session already completed")
+            }
+            val now = nowEpochSeconds()
+            if (session.status == PairSessionStatus.EXPIRED ||
+                (now > session.expiresAtEpochSec &&
+                    (session.status == PairSessionStatus.PENDING || session.status == PairSessionStatus.APPROVED))
+            ) {
+                session.status = PairSessionStatus.EXPIRED
+                expiryJob?.cancel()
+                expiryJob = null
+                _state.value = PairingSessionState.Expired(port = boundPort)
+                return@withLock CancelOutcome.Error(HttpStatusCode.Gone, "Pairing session expired")
+            }
+            if (session.status == PairSessionStatus.REJECTED) {
+                return@withLock CancelOutcome.Cancelled(
+                    sessionId = session.sessionId,
+                    requesterName = session.requesterName,
+                    alreadyRejected = true,
+                )
+            }
+
+            session.status = PairSessionStatus.REJECTED
+            expiryJob?.cancel()
+            expiryJob = null
+            _state.value = PairingSessionState.Rejected(
+                port = boundPort,
+                message = "Pairing cancelled by ${session.requesterName}",
+            )
+            CancelOutcome.Cancelled(
+                sessionId = session.sessionId,
+                requesterName = session.requesterName,
+                alreadyRejected = false,
+            )
+        }
+
+        when (outcome) {
+            is CancelOutcome.Error -> {
+                respondError(call, outcome.httpStatus, outcome.message)
+            }
+
+            is CancelOutcome.Cancelled -> {
+                if (!outcome.alreadyRejected) {
+                    onLog("Cancelled pairing session ${outcome.sessionId} by ${outcome.requesterName}")
+                }
+                call.respondText(
+                    text = ProtocolJson.encodePairStatusResponse(
+                        PairStatusResponse(
+                            version = PAIRING_PROTOCOL_VERSION,
+                            sessionId = outcome.sessionId,
+                            status = PairSessionStatus.REJECTED,
+                        ),
+                    ),
+                    contentType = ContentType.Application.Json,
+                    status = HttpStatusCode.OK,
+                )
+            }
+        }
     }
 
     private suspend fun handlePairConfirm(call: RoutingCall) {
@@ -401,6 +524,8 @@ class PairingSessionServer(
             val now = nowEpochSeconds()
             if (now > session.expiresAtEpochSec) {
                 session.status = PairSessionStatus.EXPIRED
+                expiryJob?.cancel()
+                expiryJob = null
                 _state.value = PairingSessionState.Expired(port = boundPort)
                 return@withLock ConfirmCheckOutcome.Error(HttpStatusCode.Gone, "Pairing session expired")
             }
@@ -468,6 +593,8 @@ class PairingSessionServer(
                     checkOutcome.session.confirming = false
                     checkOutcome.session.completed = true
                     if (activeSession === checkOutcome.session) {
+                        expiryJob?.cancel()
+                        expiryJob = null
                         _state.value = PairingSessionState.Completed(checkOutcome.peer)
                     }
                 }
@@ -488,6 +615,41 @@ class PairingSessionServer(
         }
     }
 
+    private fun scheduleExpiryLocked(sessionId: String) {
+        expiryJob?.cancel()
+        val ttlSeconds = sessionTtlSeconds.coerceAtLeast(1L)
+        expiryJob = serverScope?.launch {
+            delay((ttlSeconds + 1L) * 1_000L)
+            expireSessionIfCurrent(sessionId)
+        }
+    }
+
+    private suspend fun expireSessionIfCurrent(sessionId: String) {
+        val expired = sessionMutex.withLock {
+            val current = activeSession ?: return@withLock false
+            if (current.sessionId != sessionId || current.completed || current.confirming) {
+                return@withLock false
+            }
+            if (current.status != PairSessionStatus.PENDING &&
+                current.status != PairSessionStatus.APPROVED
+            ) {
+                return@withLock false
+            }
+            if (nowEpochSeconds() <= current.expiresAtEpochSec) {
+                return@withLock false
+            }
+            current.status = PairSessionStatus.EXPIRED
+            expiryJob = null
+            if (server != null) {
+                _state.value = PairingSessionState.Expired(port = boundPort)
+            }
+            true
+        }
+        if (expired) {
+            onLog("Pairing session $sessionId expired")
+        }
+    }
+
     private suspend fun respondError(
         call: RoutingCall,
         httpStatus: HttpStatusCode,
@@ -503,6 +665,15 @@ class PairingSessionServer(
             contentType = ContentType.Application.Json,
             status = httpStatus,
         )
+    }
+
+    private sealed interface CancelOutcome {
+        data class Error(val httpStatus: HttpStatusCode, val message: String) : CancelOutcome
+        data class Cancelled(
+            val sessionId: String,
+            val requesterName: String,
+            val alreadyRejected: Boolean,
+        ) : CancelOutcome
     }
 
     private sealed interface ConfirmCheckOutcome {

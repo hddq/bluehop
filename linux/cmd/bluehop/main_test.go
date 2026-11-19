@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hddq/bluehop/linux/internal/pairing"
 	"github.com/hddq/bluehop/linux/internal/peers"
 )
 
@@ -301,5 +303,101 @@ func TestCLIPairRejectObservedWithinDefaultPoll(t *testing.T) {
 	}
 	if !strings.Contains(cliStderr.String(), "rejected") {
 		t.Fatalf("expected client to observe rejection reason rather than connection failure, got stderr=%q", cliStderr.String())
+	}
+}
+
+func TestCLIPairListenExitsWhenClientCancels(t *testing.T) {
+	dir := t.TempDir()
+	srvStorePath := filepath.Join(dir, "srv-peers.json")
+
+	pr, pw := io.Pipe()
+	srvInR, srvInW := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+		_ = srvInR.Close()
+		_ = srvInW.Close()
+	})
+
+	var srvStderr bytes.Buffer
+	srvCodeCh := make(chan int, 1)
+	go func() {
+		code := runWithIO(
+			[]string{"pair", "--listen", "--addr", "127.0.0.1:0", "--name", "Linux Server", "--store", srvStorePath, "--timeout", "10s"},
+			srvInR,
+			pw,
+			&srvStderr,
+		)
+		_ = pw.Close()
+		srvCodeCh <- code
+	}()
+
+	portCh := make(chan string, 1)
+	sasCh := make(chan string, 1)
+	outCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var acc string
+		portRe := regexp.MustCompile(`on port (\d+)`)
+		sasRe := regexp.MustCompile(`Verification code \(SAS\): (\d{3} \d{3})`)
+		portSent, sasSent := false, false
+		for {
+			n, err := pr.Read(buf)
+			if n > 0 {
+				acc += string(buf[:n])
+				if !portSent {
+					if m := portRe.FindStringSubmatch(acc); len(m) == 2 {
+						portSent = true
+						portCh <- m[1]
+					}
+				}
+				if !sasSent {
+					if m := sasRe.FindStringSubmatch(acc); len(m) == 2 {
+						sasSent = true
+						sasCh <- m[1]
+					}
+				}
+			}
+			if err != nil {
+				outCh <- acc
+				return
+			}
+		}
+	}()
+
+	port := <-portCh
+	client := pairing.NewClient(pairing.ClientConfig{PollInterval: 10 * time.Millisecond})
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	defer cancelClient()
+	clientSASCh := make(chan pairing.SASChallenge, 1)
+	clientErrCh := make(chan error, 1)
+	go func() {
+		_, err := client.PairWithHost(
+			clientCtx,
+			"127.0.0.1:"+port,
+			peers.Identity{DeviceID: "cli-client", DeviceName: "Linux Client"},
+			func(ch pairing.SASChallenge) { clientSASCh <- ch },
+		)
+		clientErrCh <- err
+	}()
+
+	<-sasCh
+	<-clientSASCh
+	cancelClient()
+
+	select {
+	case code := <-srvCodeCh:
+		if code == 0 {
+			t.Fatalf("expected non-zero exit when client cancels pairing")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for server to exit on client cancel; stderr=%q", srvStderr.String())
+	}
+	if err := <-clientErrCh; err == nil {
+		t.Fatal("expected cancelled client to fail")
+	}
+	out := <-outCh
+	if !strings.Contains(out, "Pairing cancelled by peer.") {
+		t.Fatalf("expected cancellation message in stdout, got %q", out)
 	}
 }

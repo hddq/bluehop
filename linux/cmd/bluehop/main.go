@@ -183,6 +183,7 @@ func runPairServer(
 
 	pendingCh := make(chan pairing.PendingSession, 1)
 	rejectedObservedCh := make(chan string, 1)
+	cancelledCh := make(chan string, 1)
 
 	type pairResult struct {
 		peer peers.Peer
@@ -224,6 +225,12 @@ func runPairServer(
 				case rejectedObservedCh <- sessionID:
 				default:
 				}
+			}
+		},
+		OnCancelled: func(sessionID string) {
+			select {
+			case cancelledCh <- sessionID:
+			default:
 			}
 		},
 	})
@@ -284,6 +291,9 @@ func runPairServer(
 	select {
 	case ans := <-answerCh:
 		accepted = ans == "y" || ans == "yes"
+	case <-cancelledCh:
+		fmt.Fprintln(stdout, "\nPairing cancelled by peer.")
+		return 1
 	case <-ctx.Done():
 		_ = srv.Reject(pending.SessionID)
 		fmt.Fprintln(stderr, "\npairing timed out")
@@ -326,6 +336,9 @@ func runPairServer(
 		}
 		fmt.Fprintf(stdout, "Paired with %s (%s)\n", res.peer.PeerName, res.peer.PeerID)
 		return 0
+	case <-cancelledCh:
+		fmt.Fprintln(stdout, "Pairing cancelled by peer.")
+		return 1
 	case <-ctx.Done():
 		pairMu.Lock()
 		started := confirmStarted

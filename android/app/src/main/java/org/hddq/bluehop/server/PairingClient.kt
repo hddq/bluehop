@@ -2,6 +2,7 @@ package org.hddq.bluehop.server
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
@@ -9,6 +10,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PAIRING_PROTOCOL_VERSION
+import org.hddq.bluehop.protocol.PairCancelRequest
 import org.hddq.bluehop.protocol.PairConfirmRequest
 import org.hddq.bluehop.protocol.PairSessionStatus
 import org.hddq.bluehop.protocol.PairStartRequest
@@ -40,12 +42,17 @@ class PairingClient(
         localIdentity: LocalDeviceIdentity,
         onSasReady: (sas: String, responderName: String) -> Unit = { _, _ -> },
     ): Result<PairedPeer> = withContext(Dispatchers.IO) {
+        var baseUrl: String? = null
+        var sessionId: String? = null
+        var serverTerminated = false
+        var completed = false
         try {
             require(totalTimeoutMs > 0) { "Total timeout must be positive" }
             require(pollIntervalMs > 0L) { "Poll interval must be positive" }
             val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(totalTimeoutMs.toLong())
 
-            val baseUrl = formatBaseUrl(host, port)
+            val resolvedBaseUrl = formatBaseUrl(host, port)
+            baseUrl = resolvedBaseUrl
             val myKeyPair = PairingCrypto.generateEphemeralKeyPair()
             val clientPubBase64 = PairingCrypto.encodePublicKey(myKeyPair.public)
 
@@ -56,7 +63,7 @@ class PairingClient(
                 clientPub = clientPubBase64,
             )
             val startHttpResponse = postJson(
-                url = "$baseUrl/pair/start",
+                url = "$resolvedBaseUrl/pair/start",
                 jsonBody = ProtocolJson.encodePairStartRequest(startRequest),
                 deadlineNanos = deadlineNanos,
             )
@@ -80,6 +87,7 @@ class PairingClient(
             require(startResponse.responderId != localIdentity.deviceId) {
                 "Cannot pair device with itself"
             }
+            sessionId = startResponse.sessionId
 
             val serverPubKey = PairingCrypto.decodePublicKey(startResponse.serverPub)
             val sharedSecret = PairingCrypto.computeSharedSecret(myKeyPair.private, serverPubKey)
@@ -93,7 +101,7 @@ class PairingClient(
             onSasReady(keys.sas, responderName)
 
             val encodedSessionId = URLEncoder.encode(startResponse.sessionId, Charsets.UTF_8)
-            val statusUrl = "$baseUrl/pair/status?sessionId=$encodedSessionId"
+            val statusUrl = "$resolvedBaseUrl/pair/status?sessionId=$encodedSessionId"
             while (true) {
                 val statusHttpResponse = get(statusUrl, deadlineNanos)
                 if (statusHttpResponse.statusCode !in 200..299) {
@@ -108,8 +116,14 @@ class PairingClient(
                 }
                 when (statusResponse.status) {
                     PairSessionStatus.APPROVED -> break
-                    PairSessionStatus.REJECTED -> error("Pairing rejected by host")
-                    PairSessionStatus.EXPIRED -> error("Pairing session expired")
+                    PairSessionStatus.REJECTED -> {
+                        serverTerminated = true
+                        error("Pairing rejected by host")
+                    }
+                    PairSessionStatus.EXPIRED -> {
+                        serverTerminated = true
+                        error("Pairing session expired")
+                    }
                     PairSessionStatus.PENDING -> {
                         val remainingMs = remainingMillis(deadlineNanos).toLong()
                         delay(minOf(pollIntervalMs, remainingMs))
@@ -125,7 +139,7 @@ class PairingClient(
                 responderId = startResponse.responderId,
             )
             val confirmHttpResponse = postJson(
-                url = "$baseUrl/pair/confirm",
+                url = "$resolvedBaseUrl/pair/confirm",
                 jsonBody = ProtocolJson.encodePairConfirmRequest(
                     PairConfirmRequest(
                         version = PAIRING_PROTOCOL_VERSION,
@@ -136,6 +150,9 @@ class PairingClient(
                 deadlineNanos = deadlineNanos,
             )
             if (confirmHttpResponse.statusCode !in 200..299) {
+                if (confirmHttpResponse.statusCode == 403 || confirmHttpResponse.statusCode == 410) {
+                    serverTerminated = true
+                }
                 error(extractErrorMessage(confirmHttpResponse, "Pairing confirmation failed"))
             }
 
@@ -157,6 +174,7 @@ class PairingClient(
             )
             check(serverConfirmValid) { "Host key confirmation failed" }
 
+            completed = true
             Result.success(
                 PairedPeer(
                     peerId = startResponse.responderId,
@@ -169,6 +187,30 @@ class PairingClient(
             throw cancel
         } catch (error: Throwable) {
             Result.failure(error)
+        } finally {
+            val activeUrl = baseUrl
+            val activeSessionId = sessionId
+            if (activeUrl != null && activeSessionId != null && !completed && !serverTerminated) {
+                withContext(NonCancellable) {
+                    sendCancelBestEffort(activeUrl, activeSessionId)
+                }
+            }
+        }
+    }
+
+    private suspend fun sendCancelBestEffort(baseUrl: String, sessionId: String) {
+        runCatching {
+            val cancelDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEFAULT_CANCEL_TIMEOUT_MS)
+            postJson(
+                url = "$baseUrl/pair/cancel",
+                jsonBody = ProtocolJson.encodePairCancelRequest(
+                    PairCancelRequest(
+                        version = PAIRING_PROTOCOL_VERSION,
+                        sessionId = sessionId,
+                    ),
+                ),
+                deadlineNanos = cancelDeadlineNanos,
+            )
         }
     }
 
@@ -279,6 +321,7 @@ class PairingClient(
         const val DEFAULT_READ_TIMEOUT_MS = 5_000
         const val DEFAULT_TOTAL_TIMEOUT_MS = 75_000
         const val DEFAULT_POLL_INTERVAL_MS = 500L
+        const val DEFAULT_CANCEL_TIMEOUT_MS = 1_500L
         const val MAX_RESPONSE_BYTES = 64 * 1024
 
         internal fun formatHostPort(host: String, port: Int): String {

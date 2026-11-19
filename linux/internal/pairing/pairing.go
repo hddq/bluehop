@@ -44,6 +44,7 @@ type ServerConfig struct {
 	OnPeerPaired     func(peers.Peer) error
 	OnPendingSession func(PendingSession)
 	OnStatusObserved func(sessionID string, status protocol.PairSessionStatus)
+	OnCancelled      func(sessionID string)
 	SingleSession    bool
 	SessionTTL       time.Duration
 	Now              func() time.Time
@@ -82,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/pair/start", s.handleStart)
 	mux.HandleFunc("/pair/status", s.handleStatus)
+	mux.HandleFunc("/pair/cancel", s.handleCancel)
 	mux.HandleFunc("/pair/confirm", s.handleConfirm)
 	return mux
 }
@@ -271,6 +273,68 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.OnStatusObserved != nil {
 		s.cfg.OnStatusObserved(observedID, observedStatus)
 	}
+}
+
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writePairError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req protocol.PairCancelRequest
+	if err := decodeJSONBody(r.Body, &req); err != nil {
+		writePairError(w, http.StatusBadRequest, "invalid cancellation JSON")
+		return
+	}
+	if req.Version != protocol.PairingVersion || !protocol.ValidPairingField(req.SessionID) {
+		writePairError(w, http.StatusBadRequest, "invalid cancellation parameters")
+		return
+	}
+
+	s.mu.Lock()
+	sess := s.session
+	if sess == nil || sess.id != req.SessionID {
+		s.mu.Unlock()
+		writePairError(w, http.StatusNotFound, "unknown pairing session")
+		return
+	}
+	if sess.completed {
+		s.mu.Unlock()
+		writePairError(w, http.StatusConflict, "pairing session already completed")
+		return
+	}
+	now := s.cfg.Now()
+	if sess.status == protocol.PairStatusExpired ||
+		(now.After(sess.expiresAt) &&
+			(sess.status == protocol.PairStatusPending || sess.status == protocol.PairStatusApproved)) {
+		sess.status = protocol.PairStatusExpired
+		s.mu.Unlock()
+		writePairError(w, http.StatusGone, "pairing session expired")
+		return
+	}
+	if sess.status == protocol.PairStatusRejected {
+		id := sess.id
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, protocol.PairStatusResponse{
+			Version:   protocol.PairingVersion,
+			SessionID: id,
+			Status:    protocol.PairStatusRejected,
+		})
+		return
+	}
+
+	sess.status = protocol.PairStatusRejected
+	id := sess.id
+	s.mu.Unlock()
+
+	if s.cfg.OnCancelled != nil {
+		s.cfg.OnCancelled(id)
+	}
+	writeJSON(w, http.StatusOK, protocol.PairStatusResponse{
+		Version:   protocol.PairingVersion,
+		SessionID: id,
+		Status:    protocol.PairStatusRejected,
+	})
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +542,14 @@ func (c *Client) PairWithHost(
 		return peers.Peer{}, err
 	}
 
+	var paired bool
+	var serverTerminated bool
+	defer func() {
+		if !paired && !serverTerminated && ctx.Err() != nil {
+			c.sendCancelBestEffort(baseURL, startResp.SessionID)
+		}
+	}()
+
 	if onSAS != nil {
 		onSAS(SASChallenge{
 			SessionID:     startResp.SessionID,
@@ -500,8 +572,10 @@ func (c *Client) PairWithHost(
 		case protocol.PairStatusApproved:
 			goto confirmed
 		case protocol.PairStatusRejected:
+			serverTerminated = true
 			return peers.Peer{}, errors.New("pairing rejected by host")
 		case protocol.PairStatusExpired:
+			serverTerminated = true
 			return peers.Peer{}, errors.New("pairing session expired")
 		case protocol.PairStatusPending:
 			timer := time.NewTimer(c.pollInterval)
@@ -551,6 +625,7 @@ confirmed:
 		return peers.Peer{}, errors.New("server key confirmation failed")
 	}
 
+	paired = true
 	peer := peers.Peer{
 		PeerID:           startResp.ResponderID,
 		PeerName:         strings.TrimSpace(startResp.ResponderName),
@@ -563,6 +638,16 @@ confirmed:
 		}
 	}
 	return peer, nil
+}
+
+func (c *Client) sendCancelBestEffort(baseURL, sessionID string) {
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var ignored protocol.PairStatusResponse
+	_ = c.postJSON(cancelCtx, baseURL+"/pair/cancel", protocol.PairCancelRequest{
+		Version:   protocol.PairingVersion,
+		SessionID: sessionID,
+	}, &ignored)
 }
 
 func (c *Client) getJSON(ctx context.Context, rawURL string, out any) error {

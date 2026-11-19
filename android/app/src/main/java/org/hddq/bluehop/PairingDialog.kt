@@ -393,31 +393,39 @@ fun PairingDialog(
                         clientSas = null
                         clientResponderName = null
                         clientError = null
-                        pairingJobHolder.job = coroutineScope.launch {
+                        val launchedJob = coroutineScope.launch {
+                            val currentJob = coroutineContext[Job]
                             try {
                                 val result = pairingClient.pairWithHost(
                                     host = targetHost,
                                     port = targetPort,
                                     localIdentity = identity,
                                     onSasReady = { sas, responderName ->
-                                        clientSas = sas
-                                        clientResponderName = responderName
+                                        if (pairingJobHolder.job === currentJob) {
+                                            clientSas = sas
+                                            clientResponderName = responderName
+                                        }
                                     },
                                 )
-                                result.onSuccess { peer ->
-                                    pairedPeersRepository.upsertPeer(peer)
-                                    clientPairedName = peer.peerName
-                                    clientSas = null
-                                    clientResponderName = null
-                                }.onFailure { error ->
-                                    clientSas = null
-                                    clientResponderName = null
-                                    clientError = error.message ?: "Pairing failed"
+                                if (pairingJobHolder.job === currentJob) {
+                                    result.onSuccess { peer ->
+                                        pairedPeersRepository.upsertPeer(peer)
+                                        clientPairedName = peer.peerName
+                                        clientSas = null
+                                        clientResponderName = null
+                                    }.onFailure { error ->
+                                        clientSas = null
+                                        clientResponderName = null
+                                        clientError = error.message ?: "Pairing failed"
+                                    }
                                 }
                             } finally {
-                                isPairing = false
+                                if (pairingJobHolder.job === currentJob) {
+                                    isPairing = false
+                                }
                             }
                         }
+                        pairingJobHolder.job = launchedJob
                     },
                 ) {
                     Text(text = stringResource(R.string.pairing_action_connect_pair))

@@ -345,6 +345,9 @@ class BlueHopProtocolTest {
             ProtocolJson.decodePairConfirmRequest("""{"sessionId":"s1","clientConfirm":"00"}""")
         }
         assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairCancelRequest("""{"sessionId":"s1"}""")
+        }
+        assertThrows(SerializationException::class.java) {
             ProtocolJson.decodePairConfirmResponse("""{"sessionId":"s1","serverConfirm":"00"}""")
         }
     }

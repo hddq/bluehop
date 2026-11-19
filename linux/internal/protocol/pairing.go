@@ -106,6 +106,11 @@ type PairConfirmRequest struct {
 	ClientConfirm string `json:"clientConfirm"`
 }
 
+type PairCancelRequest struct {
+	Version   int    `json:"version"`
+	SessionID string `json:"sessionId"`
+}
+
 type PairConfirmResponse struct {
 	Version       int    `json:"version"`
 	SessionID     string `json:"sessionId"`

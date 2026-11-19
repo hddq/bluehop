@@ -28,18 +28,23 @@ sequenceDiagram
     S-->>C: 200 OK {version: 2, sessionId, responderId, responderName, serverPub}
     C->>C: Derive shared, psk, confirmKey, 6-digit sas
     Note over C,S: Both displays show the 6-digit SAS
-    U->>S: Compare SAS & click Accept (or Reject)
-    loop Poll every ~500ms
-        C->>S: GET /pair/status?sessionId=...
-        S-->>C: 200 OK {version: 2, sessionId, status: pending|approved|rejected|expired}
+    alt User cancels on Client before confirmation
+        C->>S: POST /pair/cancel {version: 2, sessionId}
+        S-->>C: 200 OK {version: 2, sessionId, status: "rejected"}
+    else User acts on Server
+        U->>S: Compare SAS & click Accept (or Reject)
+        loop Poll every ~500ms
+            C->>S: GET /pair/status?sessionId=...
+            S-->>C: 200 OK {version: 2, sessionId, status: pending|approved|rejected|expired}
+        end
+        Note over C,S: Only after status == "approved"
+        C->>C: clientConfirm = HMAC-SHA256(confirmKey, "bluehop-confirm-v2\nclient\n...")
+        C->>S: POST /pair/confirm {version: 2, sessionId, clientConfirm}
+        S->>S: Constant-time verify clientConfirm, persist peer + pskHex
+        S->>S: serverConfirm = HMAC-SHA256(confirmKey, "bluehop-confirm-v2\nserver\n...")
+        S-->>C: 200 OK {version: 2, sessionId, serverConfirm}
+        C->>C: Constant-time verify serverConfirm, persist peer + pskHex
     end
-    Note over C,S: Only after status == "approved"
-    C->>C: clientConfirm = HMAC-SHA256(confirmKey, "bluehop-confirm-v2\nclient\n...")
-    C->>S: POST /pair/confirm {version: 2, sessionId, clientConfirm}
-    S->>S: Constant-time verify clientConfirm, persist peer + pskHex
-    S->>S: serverConfirm = HMAC-SHA256(confirmKey, "bluehop-confirm-v2\nserver\n...")
-    S-->>C: 200 OK {version: 2, sessionId, serverConfirm}
-    C->>C: Constant-time verify serverConfirm, persist peer + pskHex
 ```
 
 ### Public Key Encoding
@@ -82,6 +87,7 @@ where `<role>` is `"client"` for `clientConfirm` and `"server"` for `serverConfi
 
 - `POST /pair/start` -> `200 OK` (`PairStartResponse`), `400` on invalid input/key, `409` if a session is already active or completed. Pending sessions expire after **60 seconds**.
 - `GET /pair/status?sessionId=...` -> `200 OK` (`PairStatusResponse` with `status` in `pending`, `approved`, `rejected`, `expired`), `404` if unknown.
+- `POST /pair/cancel` -> `200 OK` (`PairStatusResponse` with `status: "rejected"`), `400` on invalid input, `404` if unknown, `409` if already completed, `410` if expired. Clients send this best-effort when cancelling locally so the responder does not stay waiting.
 - `POST /pair/confirm` -> `200 OK` (`PairConfirmResponse`), `401` on invalid `clientConfirm`, `403` if rejected, `409` if not yet approved or already completed, `410` if expired.
 
 ---
