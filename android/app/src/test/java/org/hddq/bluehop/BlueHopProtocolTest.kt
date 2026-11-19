@@ -29,8 +29,13 @@ import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.interfaces.ECPublicKey
+import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
+import java.security.spec.ECPoint
 import java.security.spec.ECPrivateKeySpec
+import java.security.spec.ECPublicKeySpec
+import java.security.spec.EllipticCurve
 
 class BlueHopProtocolTest {
 
@@ -292,6 +297,27 @@ class BlueHopProtocolTest {
         assertThrows(IllegalArgumentException::class.java) {
             PairingCrypto.decodePublicKey(p384PubBase64)
         }
+
+        val secp256k1Spec = ECParameterSpec(
+            EllipticCurve(
+                ECFieldFp(BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16)),
+                BigInteger.ZERO,
+                BigInteger.valueOf(7),
+            ),
+            ECPoint(
+                BigInteger("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16),
+                BigInteger("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16),
+            ),
+            BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16),
+            1,
+        )
+        val secp256k1Pub = KeyFactory.getInstance("EC").generatePublic(
+            ECPublicKeySpec(secp256k1Spec.generator, secp256k1Spec),
+        )
+        val secp256k1PubBase64 = PairingCrypto.encodePublicKey(secp256k1Pub)
+        assertThrows(IllegalArgumentException::class.java) {
+            PairingCrypto.decodePublicKey(secp256k1PubBase64)
+        }
     }
 
     @Test
@@ -301,6 +327,25 @@ class BlueHopProtocolTest {
 
         assertThrows(SerializationException::class.java) {
             ProtocolJson.decodePairStatusResponse("""{"version":2,"sessionId":"s1","status":"bogus"}""")
+        }
+    }
+
+    @Test
+    fun pairingJsonRequiresExplicitVersion() {
+        assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairStartRequest("""{"requesterId":"r1","requesterName":"Phone","clientPub":"abc"}""")
+        }
+        assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairStartResponse("""{"sessionId":"s1","responderId":"r2","responderName":"Linux","serverPub":"abc"}""")
+        }
+        assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairStatusResponse("""{"sessionId":"s1","status":"pending"}""")
+        }
+        assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairConfirmRequest("""{"sessionId":"s1","clientConfirm":"00"}""")
+        }
+        assertThrows(SerializationException::class.java) {
+            ProtocolJson.decodePairConfirmResponse("""{"sessionId":"s1","serverConfirm":"00"}""")
         }
     }
 

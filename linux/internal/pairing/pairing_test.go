@@ -274,8 +274,26 @@ func TestTamperedConfirmationRejectedWithoutPersisting(t *testing.T) {
 	if confirmResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 on bad clientConfirm, got %d", confirmResp.StatusCode)
 	}
-	if list, _ := serverStore.ListPeers(); len(list) != 0 {
-		t.Fatalf("server persisted peer after failed clientConfirm")
+	if list, err := serverStore.ListPeers(); err != nil || len(list) != 0 {
+		t.Fatalf("server persisted peer after failed clientConfirm: list=%+v err=%v", list, err)
+	}
+
+	// Approved session must remain valid so legitimate clientConfirm still completes pairing.
+	if err := srv.Approve(pending.SessionID); err == nil {
+		t.Fatal("expected session to still be approved, not pending")
+	}
+	statusResp, err := http.Get(httpSrv.URL + "/pair/status?sessionId=" + pending.SessionID)
+	if err != nil {
+		t.Fatalf("GET /pair/status: %v", err)
+	}
+	var st protocol.PairStatusResponse
+	if err := json.NewDecoder(statusResp.Body).Decode(&st); err != nil {
+		statusResp.Body.Close()
+		t.Fatalf("decode /pair/status: %v", err)
+	}
+	statusResp.Body.Close()
+	if st.Status != protocol.PairStatusApproved {
+		t.Fatalf("expected session status to remain approved after invalid MAC, got %q", st.Status)
 	}
 }
 
@@ -326,5 +344,92 @@ func TestTamperedServerConfirmRejectedByClientWithoutPersisting(t *testing.T) {
 	}
 	if list, _ := clientStore.ListPeers(); len(list) != 0 {
 		t.Fatalf("client persisted peer after failed serverConfirm")
+	}
+}
+
+func TestSingleSessionAndPaddedIDAndNoRedirects(t *testing.T) {
+	var nowUnix atomic.Int64
+	nowUnix.Store(1700000000)
+
+	srv := NewServer(ServerConfig{
+		Identity:      peers.Identity{DeviceID: "server-1", DeviceName: "Server"},
+		SingleSession: true,
+		SessionTTL:    60 * time.Second,
+		Now:           func() time.Time { return time.Unix(nowUnix.Load(), 0) },
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+
+	key, _ := protocol.GeneratePairingKey()
+	pub, _ := protocol.EncodePairingPublicKey(key.PublicKey())
+
+	// Whitespace-padded requesterId must be rejected.
+	paddedBody, _ := json.Marshal(protocol.PairStartRequest{
+		Version:       protocol.PairingVersion,
+		RequesterID:   " client-1 ",
+		RequesterName: "Client",
+		ClientPub:     pub,
+	})
+	resp, err := http.Post(httpSrv.URL+"/pair/start", "application/json", bytes.NewReader(paddedBody))
+	if err != nil {
+		t.Fatalf("POST padded /pair/start: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for padded requesterId, got %d", resp.StatusCode)
+	}
+
+	// First valid session succeeds.
+	validBody, _ := json.Marshal(protocol.PairStartRequest{
+		Version:       protocol.PairingVersion,
+		RequesterID:   "client-1",
+		RequesterName: "Client",
+		ClientPub:     pub,
+	})
+	resp, err = http.Post(httpSrv.URL+"/pair/start", "application/json", bytes.NewReader(validBody))
+	if err != nil {
+		t.Fatalf("POST valid /pair/start: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for first /pair/start, got %d", resp.StatusCode)
+	}
+
+	// Even after TTL expiry, SingleSession blocks a second session.
+	nowUnix.Add(61)
+	resp, err = http.Post(httpSrv.URL+"/pair/start", "application/json", bytes.NewReader(validBody))
+	if err != nil {
+		t.Fatalf("POST second /pair/start: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for second session with SingleSession=true, got %d", resp.StatusCode)
+	}
+
+	// Client must not follow 307 redirects.
+	var targetHits atomic.Int32
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer targetSrv.Close()
+
+	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, targetSrv.URL+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+	}))
+	defer redirectSrv.Close()
+
+	client := NewClient(ClientConfig{})
+	_, err = client.PairWithHost(
+		context.Background(),
+		redirectSrv.URL,
+		peers.Identity{DeviceID: "client-1", DeviceName: "Client"},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected redirect response to fail pairing")
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("expected redirect target not to be contacted, got %d hits", targetHits.Load())
 	}
 }

@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -180,19 +182,35 @@ func runPairServer(
 	defer ln.Close()
 
 	pendingCh := make(chan pairing.PendingSession, 1)
-	pairedCh := make(chan peers.Peer, 1)
+	rejectedObservedCh := make(chan string, 1)
+
+	type pairResult struct {
+		peer peers.Peer
+		err  error
+	}
+	pairDoneCh := make(chan pairResult, 1)
+	var pairMu sync.Mutex
+	var confirmStarted bool
+	var aborted bool
 
 	srv := pairing.NewServer(pairing.ServerConfig{
-		Identity: identity,
+		Identity:      identity,
+		SingleSession: true,
 		OnPeerPaired: func(p peers.Peer) error {
-			if err := store.UpsertPeer(p); err != nil {
-				return err
+			pairMu.Lock()
+			if aborted {
+				pairMu.Unlock()
+				return errors.New("pairing listener timed out")
 			}
+			confirmStarted = true
+			pairMu.Unlock()
+
+			err := store.UpsertPeer(p)
 			select {
-			case pairedCh <- p:
+			case pairDoneCh <- pairResult{peer: p, err: err}:
 			default:
 			}
-			return nil
+			return err
 		},
 		OnPendingSession: func(ps pairing.PendingSession) {
 			select {
@@ -200,9 +218,23 @@ func runPairServer(
 			default:
 			}
 		},
+		OnStatusObserved: func(sessionID string, status protocol.PairSessionStatus) {
+			if status == protocol.PairStatusRejected {
+				select {
+				case rejectedObservedCh <- sessionID:
+				default:
+				}
+			}
+		},
 	})
 
-	httpSrv := &http.Server{Handler: srv.Handler()}
+	httpSrv := &http.Server{
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
 	serveErrCh := make(chan error, 1)
 	go func() {
 		err := httpSrv.Serve(ln)
@@ -219,7 +251,7 @@ func runPairServer(
 
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 	fmt.Fprintf(stdout, "Waiting for pairing request as %s on port %s\n", identity.DeviceName, portStr)
-	for _, ep := range localListeningEndpoints(portStr) {
+	for _, ep := range listeningEndpoints(listenAddr, ln.Addr()) {
 		fmt.Fprintf(stdout, "  %s\n", ep)
 	}
 
@@ -261,8 +293,22 @@ func runPairServer(
 	if !accepted {
 		_ = srv.Reject(pending.SessionID)
 		fmt.Fprintln(stdout, "Pairing rejected.")
-		// Give client a brief moment to poll the rejected status.
-		time.Sleep(200 * time.Millisecond)
+		// Keep serving rejected status until client observes it or a >500ms poll grace window elapses.
+		timer := time.NewTimer(1500 * time.Millisecond)
+		defer timer.Stop()
+	waitReject:
+		for {
+			select {
+			case observed := <-rejectedObservedCh:
+				if observed == pending.SessionID {
+					break waitReject
+				}
+			case <-timer.C:
+				break waitReject
+			case <-ctx.Done():
+				break waitReject
+			}
+		}
 		return 1
 	}
 
@@ -273,10 +319,29 @@ func runPairServer(
 
 	fmt.Fprintln(stdout, "Approved. Waiting for peer key confirmation...")
 	select {
-	case peer := <-pairedCh:
-		fmt.Fprintf(stdout, "Paired with %s (%s)\n", peer.PeerName, peer.PeerID)
+	case res := <-pairDoneCh:
+		if res.err != nil {
+			fmt.Fprintf(stderr, "failed to save paired peer: %v\n", res.err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Paired with %s (%s)\n", res.peer.PeerName, res.peer.PeerID)
 		return 0
 	case <-ctx.Done():
+		pairMu.Lock()
+		started := confirmStarted
+		if !started {
+			aborted = true
+		}
+		pairMu.Unlock()
+		if started {
+			res := <-pairDoneCh
+			if res.err != nil {
+				fmt.Fprintf(stderr, "failed to save paired peer: %v\n", res.err)
+				return 1
+			}
+			fmt.Fprintf(stdout, "Paired with %s (%s)\n", res.peer.PeerName, res.peer.PeerID)
+			return 0
+		}
 		fmt.Fprintln(stderr, "timed out waiting for peer key confirmation")
 		return 1
 	}
@@ -367,7 +432,28 @@ func formatSAS(sas string) string {
 	return sas
 }
 
-func localListeningEndpoints(port string) []string {
+func listeningEndpoints(listenAddr string, boundAddr net.Addr) []string {
+	tcpAddr, ok := boundAddr.(*net.TCPAddr)
+	if !ok {
+		return []string{boundAddr.String()}
+	}
+	portStr := strconv.Itoa(tcpAddr.Port)
+	if tcpAddr.IP != nil && !tcpAddr.IP.IsUnspecified() {
+		return []string{net.JoinHostPort(tcpAddr.IP.String(), portStr)}
+	}
+
+	reqHost, _, _ := net.SplitHostPort(listenAddr)
+	wantV4, wantV6 := true, true
+	switch reqHost {
+	case "0.0.0.0":
+		wantV6 = false
+	case "::":
+		wantV4 = false
+	}
+	return localListeningEndpoints(portStr, wantV4, wantV6)
+}
+
+func localListeningEndpoints(port string, wantV4, wantV6 bool) []string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
@@ -384,6 +470,13 @@ func localListeningEndpoints(port string) []string {
 		for _, a := range addrs {
 			ipNet, ok := a.(*net.IPNet)
 			if !ok || ipNet.IP == nil || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			isV4 := ipNet.IP.To4() != nil
+			if isV4 && !wantV4 {
+				continue
+			}
+			if !isV4 && !wantV6 {
 				continue
 			}
 			out = append(out, net.JoinHostPort(ipNet.IP.String(), port))

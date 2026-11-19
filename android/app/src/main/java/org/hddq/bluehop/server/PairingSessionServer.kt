@@ -12,11 +12,14 @@ import io.ktor.server.routing.RoutingCall
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import org.hddq.bluehop.protocol.HmacSigner
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
@@ -233,6 +236,7 @@ class PairingSessionServer(
             return
         }
         if (!PairingCrypto.isValidSingleLineField(request.requesterId) ||
+            request.requesterId != request.requesterId.trim() ||
             !PairingCrypto.isValidSingleLineField(request.requesterName) ||
             !PairingCrypto.isValidSingleLineField(request.clientPub)
         ) {
@@ -416,11 +420,6 @@ class PairingSessionServer(
                 macHex = request.clientConfirm,
             )
             if (!clientValid) {
-                session.status = PairSessionStatus.REJECTED
-                _state.value = PairingSessionState.Rejected(
-                    port = boundPort,
-                    message = "Key confirmation failed",
-                )
                 return@withLock ConfirmCheckOutcome.Error(
                     HttpStatusCode.Unauthorized,
                     "Client key confirmation failed",
@@ -454,9 +453,12 @@ class PairingSessionServer(
                 try {
                     onPeerPaired(checkOutcome.peer)
                 } catch (error: Throwable) {
-                    sessionMutex.withLock {
-                        checkOutcome.session.confirming = false
+                    withContext(NonCancellable) {
+                        sessionMutex.withLock {
+                            checkOutcome.session.confirming = false
+                        }
                     }
+                    if (error is CancellationException) throw error
                     onLog("Failed to persist paired peer ${checkOutcome.peer.peerId}: ${error.message}")
                     respondError(call, HttpStatusCode.InternalServerError, "Failed to save paired peer")
                     return
@@ -465,8 +467,10 @@ class PairingSessionServer(
                 sessionMutex.withLock {
                     checkOutcome.session.confirming = false
                     checkOutcome.session.completed = true
+                    if (activeSession === checkOutcome.session) {
+                        _state.value = PairingSessionState.Completed(checkOutcome.peer)
+                    }
                 }
-                _state.value = PairingSessionState.Completed(checkOutcome.peer)
                 onLog("Paired with ${checkOutcome.peer.peerName} (${checkOutcome.peer.peerId})")
 
                 call.respondText(

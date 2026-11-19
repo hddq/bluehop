@@ -8,7 +8,9 @@ import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.SecureRandom
 import java.security.interfaces.ECPublicKey
+import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import javax.crypto.KeyAgreement
@@ -211,6 +213,12 @@ object PairingCrypto {
     const val CONFIRM_ROLE_CLIENT = "client"
     const val CONFIRM_ROLE_SERVER = "server"
 
+    private val p256Params: ECParameterSpec by lazy {
+        val generator = KeyPairGenerator.getInstance(EC_ALGORITHM)
+        generator.initialize(ECGenParameterSpec(EC_CURVE))
+        (generator.generateKeyPair().public as ECPublicKey).params
+    }
+
     fun generateEphemeralKeyPair(random: SecureRandom = SecureRandom()): KeyPair {
         val generator = KeyPairGenerator.getInstance(EC_ALGORITHM)
         generator.initialize(ECGenParameterSpec(EC_CURVE), random)
@@ -224,10 +232,21 @@ object PairingCrypto {
         val bytes = Base64.getDecoder().decode(base64)
         val key = KeyFactory.getInstance(EC_ALGORITHM).generatePublic(X509EncodedKeySpec(bytes))
         val ecKey = key as? ECPublicKey ?: error("Public key is not an EC key")
-        require(ecKey.params.curve.field.fieldSize == 256 && ecKey.params.order.bitLength() == 256) {
+        require(isP256Params(ecKey.params)) {
             "Public key is not on P-256"
         }
         return ecKey
+    }
+
+    private fun isP256Params(params: ECParameterSpec): Boolean {
+        val expectedField = p256Params.curve.field as? ECFieldFp ?: return false
+        val actualField = params.curve.field as? ECFieldFp ?: return false
+        return actualField.p == expectedField.p &&
+            params.curve.a == p256Params.curve.a &&
+            params.curve.b == p256Params.curve.b &&
+            params.generator == p256Params.generator &&
+            params.order == p256Params.order &&
+            params.cofactor == p256Params.cofactor
     }
 
     fun computeSharedSecret(privateKey: PrivateKey, peerPublicKey: PublicKey): ByteArray {

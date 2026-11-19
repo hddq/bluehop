@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"io"
+	"net"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime/debug"
 	"strings"
@@ -200,5 +202,104 @@ func TestCLIPairListenAndConnectAndPeers(t *testing.T) {
 	var rmOut, rmErr bytes.Buffer
 	if code := runWithIO([]string{"peers", "--store", cliStorePath, "remove", cliPeers[0].PeerID}, strings.NewReader(""), &rmOut, &rmErr); code != 0 {
 		t.Fatalf("peers remove failed: %d %s", code, rmErr.String())
+	}
+}
+
+func TestListeningEndpointsExplicitBind(t *testing.T) {
+	gotV4 := listeningEndpoints("127.0.0.1:0", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 43215})
+	wantV4 := []string{"127.0.0.1:43215"}
+	if !reflect.DeepEqual(gotV4, wantV4) {
+		t.Fatalf("listeningEndpoints(v4) = %v, want %v", gotV4, wantV4)
+	}
+
+	gotV6 := listeningEndpoints("[::1]:0", &net.TCPAddr{IP: net.ParseIP("::1"), Port: 43215})
+	wantV6 := []string{"[::1]:43215"}
+	if !reflect.DeepEqual(gotV6, wantV6) {
+		t.Fatalf("listeningEndpoints(v6) = %v, want %v", gotV6, wantV6)
+	}
+}
+
+func TestCLIPairRejectObservedWithinDefaultPoll(t *testing.T) {
+	dir := t.TempDir()
+	srvStorePath := filepath.Join(dir, "srv-peers.json")
+	cliStorePath := filepath.Join(dir, "cli-peers.json")
+
+	pr, pw := io.Pipe()
+	srvInR, srvInW := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+		_ = srvInR.Close()
+		_ = srvInW.Close()
+	})
+
+	var srvStderr bytes.Buffer
+	srvCodeCh := make(chan int, 1)
+	go func() {
+		code := runWithIO(
+			[]string{"pair", "--listen", "--addr", "127.0.0.1:0", "--name", "Linux Server", "--store", srvStorePath, "--timeout", "10s"},
+			srvInR,
+			pw,
+			&srvStderr,
+		)
+		_ = pw.Close()
+		srvCodeCh <- code
+	}()
+
+	portCh := make(chan string, 1)
+	sasCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var acc string
+		portRe := regexp.MustCompile(`on port (\d+)`)
+		sasRe := regexp.MustCompile(`Verification code \(SAS\): (\d{3} \d{3})`)
+		portSent, sasSent := false, false
+		for {
+			n, err := pr.Read(buf)
+			if n > 0 {
+				acc += string(buf[:n])
+				if !portSent {
+					if m := portRe.FindStringSubmatch(acc); len(m) == 2 {
+						portSent = true
+						portCh <- m[1]
+					}
+				}
+				if !sasSent {
+					if m := sasRe.FindStringSubmatch(acc); len(m) == 2 {
+						sasSent = true
+						sasCh <- m[1]
+					}
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	port := <-portCh
+	var cliStdout, cliStderr bytes.Buffer
+	cliCodeCh := make(chan int, 1)
+	go func() {
+		cliCodeCh <- runWithIO(
+			[]string{"pair", "--name", "Linux Client", "--store", cliStorePath, "--timeout", "10s", "127.0.0.1:" + port},
+			strings.NewReader(""),
+			&cliStdout,
+			&cliStderr,
+		)
+	}()
+
+	<-sasCh
+	_, _ = srvInW.Write([]byte("n\n"))
+	_ = srvInW.Close()
+
+	if code := <-srvCodeCh; code == 0 {
+		t.Fatalf("expected non-zero exit when server rejects pairing")
+	}
+	if code := <-cliCodeCh; code == 0 {
+		t.Fatalf("expected non-zero exit on rejected client")
+	}
+	if !strings.Contains(cliStderr.String(), "rejected") {
+		t.Fatalf("expected client to observe rejection reason rather than connection failure, got stderr=%q", cliStderr.String())
 	}
 }

@@ -71,6 +71,7 @@ class PairingClient(
             require(
                 PairingCrypto.isValidSingleLineField(startResponse.sessionId) &&
                     PairingCrypto.isValidSingleLineField(startResponse.responderId) &&
+                    startResponse.responderId == startResponse.responderId.trim() &&
                     PairingCrypto.isValidSingleLineField(startResponse.responderName) &&
                     PairingCrypto.isValidSingleLineField(startResponse.serverPub),
             ) {
@@ -193,6 +194,7 @@ class PairingClient(
         val initialRemainingMs = remainingMillis(deadlineNanos)
         val connection = (URI.create(url).toURL().openConnection() as HttpURLConnection).apply {
             requestMethod = method
+            instanceFollowRedirects = false
             connectTimeout = minOf(connectTimeoutMs, initialRemainingMs)
             readTimeout = minOf(readTimeoutMs, initialRemainingMs)
             useCaches = false

@@ -1,5 +1,6 @@
 package org.hddq.bluehop.protocol
 
+import kotlinx.serialization.Required
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -78,7 +79,7 @@ enum class PairSessionStatus(val wireValue: String) {
 
 @Serializable
 data class PairStartRequest(
-    val version: Int = PAIRING_PROTOCOL_VERSION,
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
     val requesterId: String,
     val requesterName: String,
     val clientPub: String,
@@ -86,7 +87,7 @@ data class PairStartRequest(
 
 @Serializable
 data class PairStartResponse(
-    val version: Int = PAIRING_PROTOCOL_VERSION,
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
     val sessionId: String,
     val responderId: String,
     val responderName: String,
@@ -95,21 +96,21 @@ data class PairStartResponse(
 
 @Serializable
 data class PairStatusResponse(
-    val version: Int = PAIRING_PROTOCOL_VERSION,
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
     val sessionId: String,
     val status: PairSessionStatus,
 )
 
 @Serializable
 data class PairConfirmRequest(
-    val version: Int = PAIRING_PROTOCOL_VERSION,
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
     val sessionId: String,
     val clientConfirm: String,
 )
 
 @Serializable
 data class PairConfirmResponse(
-    val version: Int = PAIRING_PROTOCOL_VERSION,
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
     val sessionId: String,
     val serverConfirm: String,
 )

@@ -43,6 +43,8 @@ type ServerConfig struct {
 	Identity         peers.Identity
 	OnPeerPaired     func(peers.Peer) error
 	OnPendingSession func(PendingSession)
+	OnStatusObserved func(sessionID string, status protocol.PairSessionStatus)
+	SingleSession    bool
 	SessionTTL       time.Duration
 	Now              func() time.Time
 }
@@ -136,6 +138,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !protocol.ValidPairingField(req.RequesterID) ||
+		req.RequesterID != strings.TrimSpace(req.RequesterID) ||
 		!protocol.ValidPairingField(req.RequesterName) ||
 		!protocol.ValidPairingField(req.ClientPub) {
 		writePairError(w, http.StatusBadRequest, "invalid pairing parameters")
@@ -192,6 +195,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 			writePairError(w, http.StatusConflict, "pairing session already completed")
 			return
 		}
+		if s.cfg.SingleSession {
+			s.mu.Unlock()
+			writePairError(w, http.StatusConflict, "pairing listener already handled a session")
+			return
+		}
 		if s.session.status == protocol.PairStatusPending || s.session.status == protocol.PairStatusApproved {
 			s.mu.Unlock()
 			writePairError(w, http.StatusConflict, "pairing session already in progress")
@@ -242,9 +250,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.session == nil || s.session.id != sessionID {
+		s.mu.Unlock()
 		writePairError(w, http.StatusNotFound, "unknown pairing session")
 		return
 	}
@@ -252,11 +259,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		(s.session.status == protocol.PairStatusPending || s.session.status == protocol.PairStatusApproved) {
 		s.session.status = protocol.PairStatusExpired
 	}
+	observedID := s.session.id
+	observedStatus := s.session.status
+	s.mu.Unlock()
+
 	writeJSON(w, http.StatusOK, protocol.PairStatusResponse{
 		Version:   protocol.PairingVersion,
-		SessionID: s.session.id,
-		Status:    s.session.status,
+		SessionID: observedID,
+		Status:    observedStatus,
 	})
+	if s.cfg.OnStatusObserved != nil {
+		s.cfg.OnStatusObserved(observedID, observedStatus)
+	}
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +329,6 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Identity.DeviceID,
 		req.ClientConfirm,
 	) {
-		sess.status = protocol.PairStatusRejected
 		s.mu.Unlock()
 		writePairError(w, http.StatusUnauthorized, "client key confirmation failed")
 		return
@@ -379,7 +392,18 @@ type Client struct {
 func NewClient(cfg ClientConfig) *Client {
 	hc := cfg.HTTPClient
 	if hc == nil {
-		hc = &http.Client{Timeout: defaultRequestTimeout}
+		hc = &http.Client{
+			Timeout: defaultRequestTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	} else if hc.CheckRedirect == nil {
+		cloned := *hc
+		cloned.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		hc = &cloned
 	}
 	poll := cfg.PollInterval
 	if poll <= 0 {
@@ -432,6 +456,7 @@ func (c *Client) PairWithHost(
 	}
 	if !protocol.ValidPairingField(startResp.SessionID) ||
 		!protocol.ValidPairingField(startResp.ResponderID) ||
+		startResp.ResponderID != strings.TrimSpace(startResp.ResponderID) ||
 		!protocol.ValidPairingField(startResp.ResponderName) ||
 		!protocol.ValidPairingField(startResp.ServerPub) {
 		return peers.Peer{}, errors.New("incomplete pairing start response")

@@ -37,6 +37,7 @@ import org.hddq.bluehop.server.parseManualPairingAddress
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume
@@ -364,7 +365,49 @@ class PairingFlowTest {
             assertEquals(401, confirmConn.responseCode)
             confirmConn.disconnect()
             assertNull("Tampered clientConfirm must never persist peer", responderPairedPeer)
-            assertTrue(server.state.value is PairingSessionState.Rejected)
+            assertTrue(
+                "Failed clientConfirm must not revoke user approval",
+                server.state.value is PairingSessionState.ApprovedWaitingForConfirm,
+            )
+
+            // Subsequent legitimate confirmation for the same approved session must still succeed.
+            val sharedSecret = PairingCrypto.computeSharedSecret(
+                clientKeyPair.private,
+                PairingCrypto.decodePublicKey(startResp.serverPub),
+            )
+            val keys = PairingCrypto.derivePairingKeys(
+                sharedSecret = sharedSecret,
+                sessionId = startResp.sessionId,
+                clientPub = PairingCrypto.encodePublicKey(clientKeyPair.public),
+                serverPub = startResp.serverPub,
+            )
+            val validClientConfirm = PairingCrypto.computeConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = startResp.sessionId,
+                requesterId = requesterIdentity.deviceId,
+                responderId = responderIdentity.deviceId,
+            )
+            val validConfirmConn = (URI.create("http://127.0.0.1:$port/pair/confirm").toURL().openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            validConfirmConn.outputStream.use {
+                it.write(
+                    ProtocolJson.encodePairConfirmRequest(
+                        PairConfirmRequest(
+                            version = PAIRING_PROTOCOL_VERSION,
+                            sessionId = startResp.sessionId,
+                            clientConfirm = validClientConfirm,
+                        ),
+                    ).toByteArray(Charsets.UTF_8),
+                )
+            }
+            assertEquals(200, validConfirmConn.responseCode)
+            validConfirmConn.disconnect()
+            assertNotNull(responderPairedPeer)
+            assertTrue(server.state.value is PairingSessionState.Completed)
         } finally {
             server.stop()
         }
