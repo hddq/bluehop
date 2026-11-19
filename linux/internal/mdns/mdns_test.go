@@ -125,6 +125,36 @@ func TestDNSLabelEscaping(t *testing.T) {
 	}
 }
 
+func TestSelectPreferredHostPrefersSameSubnet(t *testing.T) {
+	_, lanSubnet, err := net.ParseCIDR("192.168.10.15/24")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	_, ulaSubnet, err := net.ParseCIDR("fd12:3456:789a::15/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	_, defaultRoute, err := net.ParseCIDR("0.0.0.0/0")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+
+	mgmtIP := net.ParseIP("192.168.255.10")
+	lanIP := net.ParseIP("192.168.10.10")
+	otherULA := net.ParseIP("fd99:1111:2222::10")
+	sameULA := net.ParseIP("fd12:3456:789a::10")
+
+	if got := SelectPreferredHostForSubnets([]net.IP{mgmtIP, lanIP}, nil, []*net.IPNet{defaultRoute, lanSubnet}); got != "192.168.10.10" {
+		t.Fatalf("got %q, want 192.168.10.10", got)
+	}
+	if got := SelectPreferredHostForSubnets([]net.IP{mgmtIP}, []net.IP{otherULA, sameULA}, []*net.IPNet{ulaSubnet}); got != "fd12:3456:789a::10" {
+		t.Fatalf("got %q, want fd12:3456:789a::10", got)
+	}
+	if got := SelectPreferredHostForSubnets([]net.IP{mgmtIP}, nil, []*net.IPNet{lanSubnet}); got != "192.168.255.10" {
+		t.Fatalf("fallback got %q, want 192.168.255.10", got)
+	}
+}
+
 func TestAdvertiseAndDiscoverLocal(t *testing.T) {
 	ifaces, ips := usableInterfacesAndIPs()
 	if len(ifaces) == 0 || len(ips) == 0 {
@@ -138,7 +168,6 @@ func TestAdvertiseAndDiscoverLocal(t *testing.T) {
 		ConnectedAddresses: []string{"AC:80:0A:CD:82:A1"},
 		Pairing:            false,
 		Ifaces:             ifaces,
-		IPs:                ips,
 	})
 	if err != nil {
 		t.Skipf("mDNS socket unavailable in this environment: %v", err)

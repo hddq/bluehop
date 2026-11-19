@@ -365,6 +365,7 @@ func runPairServer(
 				DeviceName: identity.DeviceName,
 				Port:       port,
 				Pairing:    true,
+				IPs:        boundAdvertiseIPs(ln.Addr()),
 			})
 			if advErr != nil {
 				fmt.Fprintf(stderr, "warning: mDNS pairing advertisement failed: %v\n", advErr)
@@ -851,6 +852,7 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 			Port:               port,
 			ConnectedAddresses: connectedAddrs,
 			Pairing:            false,
+			IPs:                boundAdvertiseIPs(srv.Addr()),
 		})
 		if advErr != nil {
 			fmt.Fprintf(stderr, "warning: mDNS advertisement failed: %v\n", advErr)
@@ -1020,6 +1022,14 @@ func isLoopbackAddr(addr net.Addr) bool {
 		return false
 	}
 	return tcpAddr.IP.IsLoopback()
+}
+
+func boundAdvertiseIPs(addr net.Addr) []string {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || tcpAddr.IP == nil || tcpAddr.IP.IsUnspecified() || tcpAddr.IP.IsLoopback() {
+		return nil
+	}
+	return []string{tcpAddr.IP.String()}
 }
 
 func resolveStorePath(override string) (string, error) {

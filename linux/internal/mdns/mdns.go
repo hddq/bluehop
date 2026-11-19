@@ -96,17 +96,20 @@ func StartAdvertising(cfg AdvertiseConfig) (Advertiser, error) {
 
 	ifaces := cfg.Ifaces
 	ips := cfg.IPs
-	if len(ifaces) == 0 || len(ips) == 0 {
-		autoIfaces, autoIPs := usableInterfacesAndIPs()
-		if len(ifaces) == 0 {
-			ifaces = autoIfaces
+	if len(ifaces) == 0 {
+		if len(ips) > 0 {
+			ifaces = interfacesForIPs(ips)
 		}
-		if len(ips) == 0 {
-			ips = autoIPs
+		if len(ifaces) == 0 {
+			autoIfaces, autoIPs := usableInterfacesAndIPs()
+			ifaces = autoIfaces
+			if len(ips) == 0 && len(autoIPs) == 0 {
+				return nil, fmt.Errorf("no usable local IP addresses available for mDNS advertising")
+			}
 		}
 	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no usable local IP addresses available for mDNS advertising")
+	if len(ifaces) == 0 {
+		return nil, fmt.Errorf("no usable network interfaces available for mDNS advertising")
 	}
 
 	hostName := strings.TrimSpace(cfg.HostName)
@@ -122,6 +125,9 @@ func StartAdvertising(cfg AdvertiseConfig) (Advertiser, error) {
 	instanceName := escapeDNSLabel(BuildServiceName(cfg.DeviceName, cfg.Pairing))
 	txt := BuildTXT(cfg)
 
+	// Leaving ips empty lets zeroconf resolve each interface's own IPv4/IPv6
+	// addresses per outgoing/receiving interface (RFC 6762 §15), avoiding
+	// leaking addresses from unrelated VLANs/NICs onto another subnet.
 	srv, err := zeroconf.RegisterProxy(
 		instanceName,
 		ServiceType,
@@ -143,6 +149,7 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]DiscoveredPeer, erro
 	if len(ifaces) == 0 {
 		ifaces, _ = usableInterfacesAndIPs()
 	}
+	localSubnets := usableLocalSubnets(ifaces)
 
 	var resolverOpts []zeroconf.ClientOption
 	if len(ifaces) > 0 {
@@ -166,7 +173,7 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]DiscoveredPeer, erro
 
 	byKey := make(map[string]DiscoveredPeer)
 	for entry := range entries {
-		peer, ok := parseServiceEntry(entry)
+		peer, ok := parseServiceEntryWithSubnets(entry, localSubnets)
 		if !ok {
 			continue
 		}
@@ -257,10 +264,14 @@ func BuildTXT(cfg AdvertiseConfig) []string {
 }
 
 func parseServiceEntry(entry *zeroconf.ServiceEntry) (DiscoveredPeer, bool) {
+	return parseServiceEntryWithSubnets(entry, nil)
+}
+
+func parseServiceEntryWithSubnets(entry *zeroconf.ServiceEntry, localSubnets []*net.IPNet) (DiscoveredPeer, bool) {
 	if entry == nil || entry.Port <= 0 {
 		return DiscoveredPeer{}, false
 	}
-	host := SelectPreferredHost(entry.AddrIPv4, entry.AddrIPv6)
+	host := SelectPreferredHostForSubnets(entry.AddrIPv4, entry.AddrIPv6, localSubnets)
 	if host == "" {
 		return DiscoveredPeer{}, false
 	}
@@ -341,6 +352,29 @@ func normalizeAddresses(input []string) []string {
 }
 
 func SelectPreferredHost(ipv4s, ipv6s []net.IP) string {
+	return SelectPreferredHostForSubnets(ipv4s, ipv6s, nil)
+}
+
+func SelectPreferredHostForSubnets(ipv4s, ipv6s []net.IP, localSubnets []*net.IPNet) string {
+	if len(localSubnets) > 0 {
+		if best := bestMatchingSubnetIP(ipv4s, localSubnets, func(ip net.IP) bool {
+			v4 := ip.To4()
+			return v4 != nil && isUsableLocalIP(v4)
+		}); best != nil {
+			return best.To4().String()
+		}
+		if best := bestMatchingSubnetIP(ipv6s, localSubnets, func(ip net.IP) bool {
+			return ip != nil && ip.To4() == nil && isUsableLocalIP(ip) && isUniqueLocalIPv6(ip)
+		}); best != nil {
+			return best.String()
+		}
+		if best := bestMatchingSubnetIP(ipv6s, localSubnets, func(ip net.IP) bool {
+			return ip != nil && ip.To4() == nil && isUsableLocalIP(ip)
+		}); best != nil {
+			return best.String()
+		}
+	}
+
 	for _, ip := range ipv4s {
 		if v4 := ip.To4(); v4 != nil && isUsableLocalIP(v4) {
 			return v4.String()
@@ -378,6 +412,41 @@ func SelectPreferredHost(ipv4s, ipv6s []net.IP) string {
 		}
 	}
 	return ""
+}
+
+func bestMatchingSubnetIP(candidates []net.IP, localSubnets []*net.IPNet, allow func(net.IP) bool) net.IP {
+	var bestIP net.IP
+	bestPrefix := -1
+	for _, ip := range candidates {
+		if !allow(ip) {
+			continue
+		}
+		for _, subnet := range localSubnets {
+			if !subnetContainsIP(subnet, ip) {
+				continue
+			}
+			ones, _ := subnet.Mask.Size()
+			if ones > bestPrefix {
+				bestPrefix = ones
+				bestIP = ip
+			}
+		}
+	}
+	return bestIP
+}
+
+func subnetContainsIP(subnet *net.IPNet, ip net.IP) bool {
+	if subnet == nil || ip == nil {
+		return false
+	}
+	ones, bits := subnet.Mask.Size()
+	if ones <= 0 || bits == 0 {
+		return false
+	}
+	if (subnet.IP.To4() != nil) != (ip.To4() != nil) {
+		return false
+	}
+	return subnet.Contains(ip)
 }
 
 func isUsableLocalIP(ip net.IP) bool {
@@ -427,6 +496,84 @@ func usableInterfacesAndIPs() ([]net.Interface, []string) {
 		}
 	}
 	return selected, ips
+}
+
+func usableLocalSubnets(ifaces []net.Interface) []*net.IPNet {
+	if len(ifaces) == 0 {
+		var err error
+		ifaces, err = net.Interfaces()
+		if err != nil {
+			return nil
+		}
+	}
+	var subnets []*net.IPNet
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || !isUsableLocalIP(ipNet.IP) {
+				continue
+			}
+			ones, bits := ipNet.Mask.Size()
+			if ones <= 0 || bits == 0 {
+				continue
+			}
+			subnets = append(subnets, ipNet)
+		}
+	}
+	return subnets
+}
+
+func interfacesForIPs(rawIPs []string) []net.Interface {
+	targets := make([]net.IP, 0, len(rawIPs))
+	for _, raw := range rawIPs {
+		if ip := net.ParseIP(strings.TrimSpace(raw)); ip != nil {
+			targets = append(targets, ip)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var matched []net.Interface
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		found := false
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok || ipNet.IP == nil {
+				continue
+			}
+			for _, target := range targets {
+				if ipNet.IP.Equal(target) {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if found {
+			matched = append(matched, iface)
+		}
+	}
+	return matched
 }
 
 func sanitizeHostname(h string) string {
