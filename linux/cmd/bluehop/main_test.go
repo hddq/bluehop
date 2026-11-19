@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -12,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hddq/bluehop/linux/internal/bluez"
 	"github.com/hddq/bluehop/linux/internal/peers"
 )
 
@@ -302,4 +306,161 @@ func TestCLIPairRejectObservedWithinDefaultPoll(t *testing.T) {
 	if !strings.Contains(cliStderr.String(), "rejected") {
 		t.Fatalf("expected client to observe rejection reason rather than connection failure, got stderr=%q", cliStderr.String())
 	}
+}
+
+type mockBluezController struct {
+	devices       []bluez.Device
+	listErr       error
+	connectErr    error
+	disconnectErr error
+	lastQuery     string
+	closed        bool
+}
+
+func (m *mockBluezController) ListDevices(context.Context) ([]bluez.Device, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	return m.devices, nil
+}
+
+func (m *mockBluezController) FindDevice(_ context.Context, query string) (bluez.Device, error) {
+	for _, d := range m.devices {
+		if strings.EqualFold(d.Address, query) || strings.EqualFold(d.DisplayName(), query) {
+			return d, nil
+		}
+	}
+	return bluez.Device{}, fmt.Errorf("%w: %q", bluez.ErrDeviceNotFound, query)
+}
+
+func (m *mockBluezController) Connect(_ context.Context, query string) (bluez.Device, error) {
+	m.lastQuery = query
+	d, err := m.FindDevice(context.Background(), query)
+	if err != nil {
+		return bluez.Device{}, err
+	}
+	if m.connectErr != nil {
+		return d, m.connectErr
+	}
+	d.Connected = true
+	return d, nil
+}
+
+func (m *mockBluezController) Disconnect(_ context.Context, query string) (bluez.Device, error) {
+	m.lastQuery = query
+	d, err := m.FindDevice(context.Background(), query)
+	if err != nil {
+		return bluez.Device{}, err
+	}
+	if m.disconnectErr != nil {
+		return d, m.disconnectErr
+	}
+	d.Connected = false
+	return d, nil
+}
+
+func (m *mockBluezController) Close() error {
+	m.closed = true
+	return nil
+}
+
+func TestCLIDevicesConnectDisconnect(t *testing.T) {
+	sample := []bluez.Device{
+		{Address: "AA:BB:CC:DD:EE:01", Alias: "Keychron K2", Connected: false},
+		{Address: "AA:BB:CC:DD:EE:02", Alias: "WH-1000XM5", Connected: true},
+	}
+
+	t.Run("devices lists paired devices", func(t *testing.T) {
+		ctrl := &mockBluezController{devices: sample}
+		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"devices"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("devices exit=%d stderr=%q", code, stderr.String())
+		}
+		if !ctrl.closed {
+			t.Fatalf("expected controller to be closed")
+		}
+		want := "AA:BB:CC:DD:EE:01\tdisconnected\tKeychron K2\nAA:BB:CC:DD:EE:02\tconnected\tWH-1000XM5\n"
+		if stdout.String() != want {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	})
+
+	t.Run("devices empty", func(t *testing.T) {
+		ctrl := &mockBluezController{}
+		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"devices"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("devices exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "No paired Bluetooth devices.") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+	})
+
+	t.Run("connect success and already connected", func(t *testing.T) {
+		ctrl := &mockBluezController{devices: sample}
+		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"connect", "Keychron K2"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("connect exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Connected to Keychron K2 (AA:BB:CC:DD:EE:01)") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+
+		stdout.Reset()
+		ctrl.connectErr = fmt.Errorf("%w: WH-1000XM5", bluez.ErrAlreadyConnected)
+		code = runWithDeps([]string{"connect", "AA:BB:CC:DD:EE:02"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("already connected exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "WH-1000XM5 (AA:BB:CC:DD:EE:02) is already connected") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+	})
+
+	t.Run("disconnect success and already disconnected", func(t *testing.T) {
+		ctrl := &mockBluezController{devices: sample}
+		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"disconnect", "WH-1000XM5"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("disconnect exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Disconnected from WH-1000XM5 (AA:BB:CC:DD:EE:02)") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+
+		stdout.Reset()
+		ctrl.disconnectErr = fmt.Errorf("%w: Keychron K2", bluez.ErrNotConnected)
+		code = runWithDeps([]string{"disconnect", "Keychron K2"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("already disconnected exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Keychron K2 (AA:BB:CC:DD:EE:01) is already disconnected") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+	})
+
+	t.Run("error cases return non-zero", func(t *testing.T) {
+		ctrl := &mockBluezController{devices: sample, connectErr: errors.New("page timeout")}
+		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
+
+		var stdout, stderr bytes.Buffer
+		if code := runWithDeps([]string{"connect"}, strings.NewReader(""), &stdout, &stderr, deps); code != 2 {
+			t.Fatalf("missing arg exit=%d, want 2", code)
+		}
+		stderr.Reset()
+		if code := runWithDeps([]string{"connect", "Keychron K2"}, strings.NewReader(""), &stdout, &stderr, deps); code != 1 {
+			t.Fatalf("connect error exit=%d, want 1", code)
+		}
+	})
 }
