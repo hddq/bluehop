@@ -1155,3 +1155,277 @@ func TestCLIGrab(t *testing.T) {
 		}
 	})
 }
+
+type mockWatchingBluezController struct {
+	*mockBluezController
+	watchCh  <-chan struct{}
+	watchErr error
+}
+
+func (m *mockWatchingBluezController) WatchChanges(context.Context) (<-chan struct{}, error) {
+	if m.watchErr != nil {
+		return nil, m.watchErr
+	}
+	return m.watchCh, nil
+}
+
+func (m *mockWatchingBluezController) setConnected(addr string, connected bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.devices {
+		if strings.EqualFold(m.devices[i].Address, addr) {
+			m.devices[i].Connected = connected
+			return
+		}
+	}
+}
+
+func TestCLIServeLiveMDNSRefresh(t *testing.T) {
+	type advEvent struct {
+		cfg mdns.AdvertiseConfig
+		adv *mockAdvertiser
+	}
+
+	t.Run("refreshes mDNS on BlueZ connect and disconnect signals and skips unchanged state", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		changesCh := make(chan struct{}, 4)
+		ctrl := &mockWatchingBluezController{
+			mockBluezController: &mockBluezController{
+				devices: []bluez.Device{
+					{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: false},
+				},
+			},
+			watchCh: changesCh,
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		events := make(chan advEvent, 8)
+		var stdout, stderr bytes.Buffer
+		codeCh := make(chan int, 1)
+		go func() {
+			codeCh <- runWithDeps(
+				[]string{"serve", "--addr", "0.0.0.0:0", "--name", "Linux Box", "--store", storePath},
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{
+					openBluez:     func() (bluez.Controller, error) { return ctrl, nil },
+					shutdownCtx:   ctx,
+					watchDebounce: 15 * time.Millisecond,
+					startAdvertising: func(cfg mdns.AdvertiseConfig) (mdns.Advertiser, error) {
+						adv := &mockAdvertiser{}
+						events <- advEvent{cfg: cfg, adv: adv}
+						return adv, nil
+					},
+				},
+			)
+		}()
+
+		waitEvent := func(desc string) advEvent {
+			t.Helper()
+			select {
+			case ev := <-events:
+				return ev
+			case <-time.After(3 * time.Second):
+				t.Fatalf("timed out waiting for %s", desc)
+				return advEvent{}
+			}
+		}
+
+		ev0 := waitEvent("initial advertisement")
+		if len(ev0.cfg.ConnectedAddresses) != 0 {
+			t.Fatalf("initial ConnectedAddresses = %v, want empty", ev0.cfg.ConnectedAddresses)
+		}
+
+		// Connect device and burst two signals to verify debounce coalescing.
+		ctrl.setConnected("AC:80:0A:CD:82:A1", true)
+		changesCh <- struct{}{}
+		changesCh <- struct{}{}
+
+		ev1 := waitEvent("connect refresh advertisement")
+		if !reflect.DeepEqual(ev1.cfg.ConnectedAddresses, []string{"AC:80:0A:CD:82:A1"}) {
+			t.Fatalf("connect ConnectedAddresses = %v, want [AC:80:0A:CD:82:A1]", ev1.cfg.ConnectedAddresses)
+		}
+		if ev0.adv.shutdownCalls.Load() != 1 {
+			t.Fatalf("expected initial advertiser to be shut down once, got %d", ev0.adv.shutdownCalls.Load())
+		}
+
+		// Send a spurious signal with no state change: should NOT re-advertise.
+		changesCh <- struct{}{}
+		select {
+		case unexpected := <-events:
+			t.Fatalf("unexpected mDNS refresh when connected addresses did not change: %+v", unexpected.cfg)
+		case <-time.After(60 * time.Millisecond):
+		}
+
+		// Disconnect device and trigger signal.
+		ctrl.setConnected("AC:80:0A:CD:82:A1", false)
+		changesCh <- struct{}{}
+
+		ev2 := waitEvent("disconnect refresh advertisement")
+		if len(ev2.cfg.ConnectedAddresses) != 0 {
+			t.Fatalf("disconnect ConnectedAddresses = %v, want empty", ev2.cfg.ConnectedAddresses)
+		}
+		if ev1.adv.shutdownCalls.Load() != 1 {
+			t.Fatalf("expected second advertiser to be shut down once, got %d", ev1.adv.shutdownCalls.Load())
+		}
+
+		cancel()
+		if code := <-codeCh; code != 0 {
+			t.Fatalf("serve exit=%d stderr=%q", code, stderr.String())
+		}
+		if ev2.adv.shutdownCalls.Load() != 1 {
+			t.Fatalf("expected final advertiser to be shut down once, got %d", ev2.adv.shutdownCalls.Load())
+		}
+		errLog := stderr.String()
+		if !strings.Contains(errLog, "Updated mDNS advertisement (connected devices: AC:80:0A:CD:82:A1)") {
+			t.Fatalf("expected connect update log in stderr, got %q", errLog)
+		}
+		if !strings.Contains(errLog, "Updated mDNS advertisement (no connected Bluetooth devices)") {
+			t.Fatalf("expected disconnect update log in stderr, got %q", errLog)
+		}
+	})
+
+	t.Run("falls back to polling when WatchChanges fails", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		ctrl := &mockWatchingBluezController{
+			mockBluezController: &mockBluezController{
+				devices: []bluez.Device{
+					{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: false},
+				},
+			},
+			watchErr: errors.New("dbus watch denied"),
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		events := make(chan advEvent, 8)
+		var stdout, stderr bytes.Buffer
+		codeCh := make(chan int, 1)
+		go func() {
+			codeCh <- runWithDeps(
+				[]string{"serve", "--addr", "0.0.0.0:0", "--name", "Linux Box", "--store", storePath},
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{
+					openBluez:         func() (bluez.Controller, error) { return ctrl, nil },
+					shutdownCtx:       ctx,
+					watchPollInterval: 20 * time.Millisecond,
+					startAdvertising: func(cfg mdns.AdvertiseConfig) (mdns.Advertiser, error) {
+						adv := &mockAdvertiser{}
+						events <- advEvent{cfg: cfg, adv: adv}
+						return adv, nil
+					},
+				},
+			)
+		}()
+
+		var ev0 advEvent
+		select {
+		case ev0 = <-events:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for initial advertisement")
+		}
+		if len(ev0.cfg.ConnectedAddresses) != 0 {
+			t.Fatalf("initial ConnectedAddresses = %v, want empty", ev0.cfg.ConnectedAddresses)
+		}
+
+		ctrl.setConnected("AC:80:0A:CD:82:A1", true)
+
+		var ev1 advEvent
+		select {
+		case ev1 = <-events:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for poll-driven refresh")
+		}
+		if !reflect.DeepEqual(ev1.cfg.ConnectedAddresses, []string{"AC:80:0A:CD:82:A1"}) {
+			t.Fatalf("poll ConnectedAddresses = %v, want [AC:80:0A:CD:82:A1]", ev1.cfg.ConnectedAddresses)
+		}
+		if ev0.adv.shutdownCalls.Load() != 1 {
+			t.Fatalf("expected initial advertiser shutdown, got %d", ev0.adv.shutdownCalls.Load())
+		}
+
+		cancel()
+		if code := <-codeCh; code != 0 {
+			t.Fatalf("serve exit=%d stderr=%q", code, stderr.String())
+		}
+		if ev1.adv.shutdownCalls.Load() != 1 {
+			t.Fatalf("expected final advertiser shutdown, got %d", ev1.adv.shutdownCalls.Load())
+		}
+		if !strings.Contains(stderr.String(), "falling back to") {
+			t.Fatalf("expected polling fallback warning in stderr, got %q", stderr.String())
+		}
+	})
+
+	t.Run("falls back to polling when signal stream closes unexpectedly", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		changesCh := make(chan struct{}, 1)
+		ctrl := &mockWatchingBluezController{
+			mockBluezController: &mockBluezController{
+				devices: []bluez.Device{
+					{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: false},
+				},
+			},
+			watchCh: changesCh,
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		events := make(chan advEvent, 8)
+		var stdout, stderr bytes.Buffer
+		codeCh := make(chan int, 1)
+		go func() {
+			codeCh <- runWithDeps(
+				[]string{"serve", "--addr", "0.0.0.0:0", "--name", "Linux Box", "--store", storePath},
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{
+					openBluez:         func() (bluez.Controller, error) { return ctrl, nil },
+					shutdownCtx:       ctx,
+					watchPollInterval: 20 * time.Millisecond,
+					startAdvertising: func(cfg mdns.AdvertiseConfig) (mdns.Advertiser, error) {
+						adv := &mockAdvertiser{}
+						events <- advEvent{cfg: cfg, adv: adv}
+						return adv, nil
+					},
+				},
+			)
+		}()
+
+		select {
+		case <-events:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for initial advertisement")
+		}
+
+		close(changesCh)
+		ctrl.setConnected("AC:80:0A:CD:82:A1", true)
+
+		var ev1 advEvent
+		select {
+		case ev1 = <-events:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for poll refresh after stream close")
+		}
+		if !reflect.DeepEqual(ev1.cfg.ConnectedAddresses, []string{"AC:80:0A:CD:82:A1"}) {
+			t.Fatalf("ConnectedAddresses = %v, want [AC:80:0A:CD:82:A1]", ev1.cfg.ConnectedAddresses)
+		}
+
+		cancel()
+		if code := <-codeCh; code != 0 {
+			t.Fatalf("serve exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "BlueZ signal stream closed") {
+			t.Fatalf("expected stream closed warning in stderr, got %q", stderr.String())
+		}
+	})
+}

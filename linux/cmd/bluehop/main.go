@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,11 +34,13 @@ import (
 var version = "dev"
 
 type cliDeps struct {
-	openBluez        func() (bluez.Controller, error)
-	startAdvertising func(mdns.AdvertiseConfig) (mdns.Advertiser, error)
-	discoverPeers    func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error)
-	newHolderClient  func() grab.HolderClient
-	shutdownCtx      context.Context
+	openBluez         func() (bluez.Controller, error)
+	startAdvertising  func(mdns.AdvertiseConfig) (mdns.Advertiser, error)
+	discoverPeers     func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error)
+	newHolderClient   func() grab.HolderClient
+	shutdownCtx       context.Context
+	watchDebounce     time.Duration
+	watchPollInterval time.Duration
 }
 
 func defaultDeps() cliDeps {
@@ -842,22 +845,40 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		return 1
 	}
 
-	var adv mdns.Advertiser
-	if deps.startAdvertising != nil && !isLoopbackAddr(srv.Addr()) {
-		connectedAddrs := connectedBluetoothAddresses(ctrl)
-		var advErr error
-		adv, advErr = deps.startAdvertising(mdns.AdvertiseConfig{
+	ctx := deps.shutdownCtx
+	if ctx == nil {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
+
+	advertiseEnabled := deps.startAdvertising != nil && !isLoopbackAddr(srv.Addr())
+	var (
+		adv          mdns.Advertiser
+		advCfg       mdns.AdvertiseConfig
+		watchChanges <-chan struct{}
+		watchErr     error
+	)
+	if advertiseEnabled {
+		if watcher, ok := ctrl.(bluez.ChangeWatcher); ok {
+			watchChanges, watchErr = watcher.WatchChanges(ctx)
+		}
+		connectedAddrs, listErr := connectedBluetoothAddresses(ctx, ctrl)
+		if listErr != nil {
+			fmt.Fprintf(stderr, "warning: initial BlueZ device query failed: %v\n", listErr)
+		}
+		advCfg = mdns.AdvertiseConfig{
 			DeviceID:           identity.DeviceID,
 			DeviceName:         identity.DeviceName,
 			Port:               port,
 			ConnectedAddresses: connectedAddrs,
 			Pairing:            false,
 			IPs:                boundAdvertiseIPs(srv.Addr()),
-		})
+		}
+		var advErr error
+		adv, advErr = deps.startAdvertising(advCfg)
 		if advErr != nil {
 			fmt.Fprintf(stderr, "warning: mDNS advertisement failed: %v\n", advErr)
-		} else {
-			defer adv.Shutdown()
 		}
 	}
 
@@ -871,16 +892,21 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		}
 	}
 
-	ctx := deps.shutdownCtx
-	if ctx == nil {
-		var stop context.CancelFunc
-		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-	}
-	<-ctx.Done()
-
-	if adv != nil {
-		adv.Shutdown()
+	if advertiseEnabled {
+		watchAndRefreshMDNS(
+			ctx,
+			ctrl,
+			adv,
+			advCfg,
+			watchChanges,
+			watchErr,
+			deps.startAdvertising,
+			deps.watchDebounce,
+			deps.watchPollInterval,
+			stderr,
+		)
+	} else {
+		<-ctx.Done()
 	}
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -890,6 +916,138 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		return 1
 	}
 	return 0
+}
+
+func watchAndRefreshMDNS(
+	ctx context.Context,
+	ctrl bluez.Controller,
+	adv mdns.Advertiser,
+	cfg mdns.AdvertiseConfig,
+	changes <-chan struct{},
+	watchErr error,
+	startAdvertising func(mdns.AdvertiseConfig) (mdns.Advertiser, error),
+	debounce time.Duration,
+	pollInterval time.Duration,
+	logOut io.Writer,
+) {
+	defer func() {
+		if adv != nil {
+			adv.Shutdown()
+		}
+	}()
+
+	if debounce <= 0 {
+		debounce = 200 * time.Millisecond
+	}
+	if pollInterval <= 0 {
+		pollInterval = 5 * time.Second
+	}
+
+	var pollTicker *time.Ticker
+	var pollCh <-chan time.Time
+	startPolling := func(reason string) {
+		if pollTicker != nil {
+			return
+		}
+		fmt.Fprintf(logOut, "warning: %s; falling back to %s polling\n", reason, pollInterval)
+		pollTicker = time.NewTicker(pollInterval)
+		pollCh = pollTicker.C
+	}
+	defer func() {
+		if pollTicker != nil {
+			pollTicker.Stop()
+		}
+	}()
+
+	if watchErr != nil && !errors.Is(watchErr, bluez.ErrWatchUnsupported) {
+		startPolling(fmt.Sprintf("BlueZ change watch failed (%v)", watchErr))
+	}
+
+	if changes == nil && pollCh == nil {
+		<-ctx.Done()
+		return
+	}
+
+	currentAddrs := slices.Clone(cfg.ConnectedAddresses)
+	refresh := func() {
+		if ctx.Err() != nil {
+			return
+		}
+		nextAddrs, err := connectedBluetoothAddresses(ctx, ctrl)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			fmt.Fprintf(logOut, "warning: query BlueZ devices for mDNS refresh failed: %v\n", err)
+			return
+		}
+		if adv != nil && slices.Equal(currentAddrs, nextAddrs) {
+			return
+		}
+		if adv != nil {
+			adv.Shutdown()
+			adv = nil
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		cfg.ConnectedAddresses = nextAddrs
+		newAdv, err := startAdvertising(cfg)
+		if err != nil {
+			fmt.Fprintf(logOut, "warning: mDNS refresh failed: %v\n", err)
+			currentAddrs = nextAddrs
+			return
+		}
+		adv = newAdv
+		currentAddrs = nextAddrs
+		if len(nextAddrs) == 0 {
+			fmt.Fprintln(logOut, "Updated mDNS advertisement (no connected Bluetooth devices)")
+		} else {
+			fmt.Fprintf(logOut, "Updated mDNS advertisement (connected devices: %s)\n", strings.Join(nextAddrs, ", "))
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-changes:
+			if !ok {
+				changes = nil
+				if ctx.Err() != nil {
+					return
+				}
+				startPolling("BlueZ signal stream closed")
+				continue
+			}
+			timer := time.NewTimer(debounce)
+		debounceLoop:
+			for {
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case _, ok := <-changes:
+					if !ok {
+						changes = nil
+						if ctx.Err() == nil {
+							startPolling("BlueZ signal stream closed")
+						}
+						break debounceLoop
+					}
+				case <-timer.C:
+					break debounceLoop
+				}
+			}
+			timer.Stop()
+			if ctx.Err() != nil {
+				return
+			}
+			refresh()
+		case <-pollCh:
+			refresh()
+		}
+	}
 }
 
 func runDiscover(args []string, stdout, stderr io.Writer, deps cliDeps) int {
@@ -994,23 +1152,41 @@ func runDiscover(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 	return 0
 }
 
-func connectedBluetoothAddresses(ctrl bluez.Controller) []string {
+func connectedBluetoothAddresses(parentCtx context.Context, ctrl bluez.Controller) ([]string, error) {
 	if ctrl == nil {
-		return nil
+		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, 3*time.Second)
 	defer cancel()
 	devices, err := ctrl.ListDevices(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	seen := make(map[string]struct{}, len(devices))
 	var addrs []string
 	for _, d := range devices {
-		if d.Connected && strings.TrimSpace(d.Address) != "" {
-			addrs = append(addrs, d.Address)
+		if !d.Connected {
+			continue
 		}
+		trimmed := strings.TrimSpace(d.Address)
+		if trimmed == "" {
+			continue
+		}
+		norm, ok := bluez.NormalizeMAC(trimmed)
+		if !ok {
+			norm = strings.ToUpper(trimmed)
+		}
+		if _, exists := seen[norm]; exists {
+			continue
+		}
+		seen[norm] = struct{}{}
+		addrs = append(addrs, norm)
 	}
-	return addrs
+	slices.Sort(addrs)
+	return addrs, nil
 }
 
 func isLoopbackAddr(addr net.Addr) bool {
