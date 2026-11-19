@@ -3,20 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
+	"github.com/hddq/bluehop/linux/internal/holder"
 	"github.com/hddq/bluehop/linux/internal/peers"
+	"github.com/hddq/bluehop/linux/internal/protocol"
 )
 
 func TestRunHelpAndVersion(t *testing.T) {
@@ -309,6 +315,7 @@ func TestCLIPairRejectObservedWithinDefaultPoll(t *testing.T) {
 }
 
 type mockBluezController struct {
+	mu            sync.Mutex
 	devices       []bluez.Device
 	listErr       error
 	connectErr    error
@@ -318,13 +325,19 @@ type mockBluezController struct {
 }
 
 func (m *mockBluezController) ListDevices(context.Context) ([]bluez.Device, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
-	return m.devices, nil
+	out := make([]bluez.Device, len(m.devices))
+	copy(out, m.devices)
+	return out, nil
 }
 
 func (m *mockBluezController) FindDevice(_ context.Context, query string) (bluez.Device, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, d := range m.devices {
 		if strings.EqualFold(d.Address, query) || strings.EqualFold(d.DisplayName(), query) {
 			return d, nil
@@ -334,32 +347,40 @@ func (m *mockBluezController) FindDevice(_ context.Context, query string) (bluez
 }
 
 func (m *mockBluezController) Connect(_ context.Context, query string) (bluez.Device, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.lastQuery = query
-	d, err := m.FindDevice(context.Background(), query)
-	if err != nil {
-		return bluez.Device{}, err
+	for i, d := range m.devices {
+		if strings.EqualFold(d.Address, query) || strings.EqualFold(d.DisplayName(), query) {
+			if m.connectErr != nil {
+				return d, m.connectErr
+			}
+			m.devices[i].Connected = true
+			return m.devices[i], nil
+		}
 	}
-	if m.connectErr != nil {
-		return d, m.connectErr
-	}
-	d.Connected = true
-	return d, nil
+	return bluez.Device{}, fmt.Errorf("%w: %q", bluez.ErrDeviceNotFound, query)
 }
 
 func (m *mockBluezController) Disconnect(_ context.Context, query string) (bluez.Device, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.lastQuery = query
-	d, err := m.FindDevice(context.Background(), query)
-	if err != nil {
-		return bluez.Device{}, err
+	for i, d := range m.devices {
+		if strings.EqualFold(d.Address, query) || strings.EqualFold(d.DisplayName(), query) {
+			if m.disconnectErr != nil {
+				return d, m.disconnectErr
+			}
+			m.devices[i].Connected = false
+			return m.devices[i], nil
+		}
 	}
-	if m.disconnectErr != nil {
-		return d, m.disconnectErr
-	}
-	d.Connected = false
-	return d, nil
+	return bluez.Device{}, fmt.Errorf("%w: %q", bluez.ErrDeviceNotFound, query)
 }
 
 func (m *mockBluezController) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.closed = true
 	return nil
 }
@@ -463,4 +484,123 @@ func TestCLIDevicesConnectDisconnect(t *testing.T) {
 			t.Fatalf("connect error exit=%d, want 1", code)
 		}
 	})
+}
+
+func TestCLIServe(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "peers.json")
+	store := peers.NewStore(storePath)
+
+	psk := make([]byte, 32)
+	for i := range psk {
+		psk[i] = byte(i + 1)
+	}
+	if err := store.UpsertPeer(peers.Peer{
+		PeerID:           "phone-1",
+		PeerName:         "Pixel",
+		PSKHex:           hex.EncodeToString(psk),
+		PairedAtEpochSec: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("UpsertPeer: %v", err)
+	}
+
+	ctrl := &mockBluezController{
+		devices: []bluez.Device{
+			{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: true},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	var stderr bytes.Buffer
+	codeCh := make(chan int, 1)
+	go func() {
+		code := runWithDeps(
+			[]string{"serve", "--addr", "127.0.0.1:0", "--name", "Linux Box", "--store", storePath},
+			strings.NewReader(""),
+			pw,
+			&stderr,
+			cliDeps{
+				openBluez:   func() (bluez.Controller, error) { return ctrl, nil },
+				shutdownCtx: ctx,
+			},
+		)
+		_ = pw.Close()
+		codeCh <- code
+	}()
+
+	portCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var acc string
+		re := regexp.MustCompile(`on port (\d+)`)
+		for {
+			n, err := pr.Read(buf)
+			if n > 0 {
+				acc += string(buf[:n])
+				if m := re.FindStringSubmatch(acc); len(m) == 2 {
+					select {
+					case portCh <- m[1]:
+					default:
+					}
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	var port string
+	select {
+	case port = <-portCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for serve port; stderr=%q", stderr.String())
+	}
+
+	statusResp, err := http.Get("http://127.0.0.1:" + port + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	var status holder.StatusResponse
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	_ = statusResp.Body.Close()
+	if !status.Connected || status.DeviceAddress == nil || *status.DeviceAddress != "AC:80:0A:CD:82:A1" {
+		t.Fatalf("unexpected /status payload: %+v", status)
+	}
+
+	signedReq, err := protocol.SignRequest(psk, protocol.GrabRequest{
+		DeviceAddress:     "AC:80:0A:CD:82:A1",
+		RequesterID:       "phone-1",
+		TimestampEpochSec: time.Now().Unix(),
+		Nonce:             "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatalf("SignRequest: %v", err)
+	}
+	reqBytes, _ := json.Marshal(signedReq)
+	relResp, err := http.Post("http://127.0.0.1:"+port+"/release", "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		t.Fatalf("POST /release: %v", err)
+	}
+	var grabResp protocol.GrabResponse
+	if err := json.NewDecoder(relResp.Body).Decode(&grabResp); err != nil {
+		t.Fatalf("decode GrabResponse: %v", err)
+	}
+	_ = relResp.Body.Close()
+	if relResp.StatusCode != http.StatusOK || grabResp.Status != protocol.StatusOK {
+		t.Fatalf("unexpected /release response: http=%d body=%+v", relResp.StatusCode, grabResp)
+	}
+
+	cancel()
+	if code := <-codeCh; code != 0 {
+		t.Fatalf("serve exit=%d, want 0; stderr=%q", code, stderr.String())
+	}
+	if !ctrl.closed {
+		t.Fatalf("expected controller to close on serve exit")
+	}
 }

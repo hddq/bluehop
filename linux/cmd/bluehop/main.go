@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
+	"github.com/hddq/bluehop/linux/internal/holder"
 	"github.com/hddq/bluehop/linux/internal/pairing"
 	"github.com/hddq/bluehop/linux/internal/peers"
 	"github.com/hddq/bluehop/linux/internal/protocol"
@@ -29,7 +30,8 @@ import (
 var version = "dev"
 
 type cliDeps struct {
-	openBluez func() (bluez.Controller, error)
+	openBluez   func() (bluez.Controller, error)
+	shutdownCtx context.Context
 }
 
 func defaultDeps() cliDeps {
@@ -62,6 +64,7 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		fmt.Fprintln(stderr, "  devices     List paired Bluetooth devices via BlueZ")
 		fmt.Fprintln(stderr, "  connect     Connect to a paired Bluetooth device")
 		fmt.Fprintln(stderr, "  disconnect  Disconnect a paired Bluetooth device")
+		fmt.Fprintln(stderr, "  serve       Run the holder HTTP server (/status, /release)")
 		fmt.Fprintln(stderr, "  pair        Pair with another BlueHop host via ECDH + 6-digit SAS")
 		fmt.Fprintln(stderr, "  peers       List or remove paired hosts")
 		fmt.Fprintln(stderr, "  version     Print the bluehop CLI version")
@@ -100,6 +103,8 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		return runBluetoothAction("connect", fs.Args()[1:], stdout, stderr, deps)
 	case "disconnect":
 		return runBluetoothAction("disconnect", fs.Args()[1:], stdout, stderr, deps)
+	case "serve":
+		return runServe(fs.Args()[1:], stdout, stderr, deps)
 	case "pair":
 		return runPair(fs.Args()[1:], stdin, stdout, stderr)
 	case "peers":
@@ -567,6 +572,88 @@ func runBluetoothAction(action string, args []string, stdout, stderr io.Writer, 
 		return 1
 	}
 	fmt.Fprintf(stdout, "Disconnected from %s (%s)\n", dev.DisplayName(), dev.Address)
+	return 0
+}
+
+func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addrFlag := fs.String("addr", holder.DefaultAddr, "Listen address")
+	nameFlag := fs.String("name", "", "Local device name reported in /status")
+	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  bluehop serve [options]")
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Options:")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return 2
+	}
+
+	storePath, err := resolveStorePath(*storeFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "resolve peer store path: %v\n", err)
+		return 1
+	}
+	store := peers.NewStore(storePath)
+	identity, err := store.GetOrCreateIdentity(*nameFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "load local identity: %v\n", err)
+		return 1
+	}
+
+	ctrl, err := deps.openBluez()
+	if err != nil {
+		fmt.Fprintf(stderr, "open BlueZ controller: %v\n", err)
+		return 1
+	}
+	defer ctrl.Close()
+
+	srv := holder.NewServer(holder.Config{
+		Identity:      identity,
+		Backend:       holder.NewBluezBackend(ctrl),
+		PeerPSKLookup: store.GetPeerPSK,
+		OnLog: func(msg string) {
+			fmt.Fprintln(stderr, msg)
+		},
+	})
+
+	port, err := srv.Start(*addrFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "start holder server on %s: %v\n", *addrFlag, err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Serving BlueHop holder endpoints as %s (%s) on port %d\n", identity.DeviceName, identity.DeviceID, port)
+	if addr := srv.Addr(); addr != nil {
+		for _, ep := range listeningEndpoints(*addrFlag, addr) {
+			fmt.Fprintf(stdout, "  http://%s\n", ep)
+		}
+	}
+
+	ctx := deps.shutdownCtx
+	if ctx == nil {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
+	<-ctx.Done()
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := srv.Stop(stopCtx); err != nil {
+		fmt.Fprintf(stderr, "stop holder server: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
