@@ -1,0 +1,50 @@
+name: Linux CI
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "linux/**"
+      - "protocol/**"
+      - ".github/workflows/linux-ci.yml"
+  pull_request:
+    paths:
+      - "linux/**"
+      - "protocol/**"
+      - ".github/workflows/linux-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: linux
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: linux/go.mod
+          cache-dependency-path: linux/go.mod
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v -race ./...
+
+      - name: Build binary
+        run: |
+          go build ./...
+          go build -o "$RUNNER_TEMP/bluehop" ./cmd/bluehop
