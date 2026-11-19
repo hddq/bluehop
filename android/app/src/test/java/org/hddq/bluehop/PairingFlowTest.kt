@@ -26,6 +26,7 @@ import org.hddq.bluehop.protocol.ProtocolVerifier
 import org.hddq.bluehop.protocol.PskStore
 import org.hddq.bluehop.server.GrabClient
 import org.hddq.bluehop.server.HolderHttpServer
+import org.hddq.bluehop.server.LocalSubnet
 import org.hddq.bluehop.server.ManualPairingTarget
 import org.hddq.bluehop.server.NsdPeerDiscovery
 import org.hddq.bluehop.server.PairingClient
@@ -771,6 +772,40 @@ class PairingFlowTest {
         assertEquals(
             listOf(ipv4Lan.hostAddress, ipv6Ula.hostAddress, ipv6Global.hostAddress),
             filtered,
+        )
+    }
+
+    @Test
+    fun selectPreferredHostPrefersSameSubnet() {
+        val mgmtVlan = InetAddress.getByName("192.168.255.10")
+        val sameLan = InetAddress.getByName("192.168.10.10")
+        val otherUla = InetAddress.getByName("fd99:1111:2222::10")
+        val sameUla = InetAddress.getByName("fd12:3456:789a::10")
+
+        val lanSubnet = LocalSubnet(InetAddress.getByName("192.168.10.15"), 24)
+        val ulaSubnet = LocalSubnet(InetAddress.getByName("fd12:3456:789a::15"), 64)
+        val defaultRoute = LocalSubnet(InetAddress.getByName("0.0.0.0"), 0)
+
+        assertEquals(
+            sameLan.hostAddress,
+            NsdPeerDiscovery.selectPreferredHost(
+                addresses = listOf(mgmtVlan, sameLan),
+                localSubnets = listOf(defaultRoute, lanSubnet),
+            ),
+        )
+        assertEquals(
+            sameUla.hostAddress,
+            NsdPeerDiscovery.selectPreferredHost(
+                addresses = listOf(mgmtVlan, otherUla, sameUla),
+                localSubnets = listOf(ulaSubnet),
+            ),
+        )
+        assertEquals(
+            mgmtVlan.hostAddress,
+            NsdPeerDiscovery.selectPreferredHost(
+                addresses = listOf(mgmtVlan),
+                localSubnets = listOf(lanSubnet),
+            ),
         )
     }
 

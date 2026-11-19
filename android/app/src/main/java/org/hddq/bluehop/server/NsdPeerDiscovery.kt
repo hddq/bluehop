@@ -3,6 +3,9 @@ package org.hddq.bluehop.server
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
@@ -15,10 +18,33 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "BlueHopNsdDiscovery"
+
+internal data class LocalSubnet(
+    val address: InetAddress,
+    val prefixLength: Int,
+) {
+    fun contains(candidate: InetAddress): Boolean {
+        val localBytes = address.address
+        val candidateBytes = candidate.address
+        if (localBytes.size != candidateBytes.size) return false
+        val maxBits = localBytes.size * 8
+        if (prefixLength <= 0 || prefixLength > maxBits) return false
+
+        val fullBytes = prefixLength / 8
+        for (i in 0 until fullBytes) {
+            if (localBytes[i] != candidateBytes[i]) return false
+        }
+        val remBits = prefixLength % 8
+        if (remBits == 0) return true
+        val mask = (0xFF shl (8 - remBits)) and 0xFF
+        return (localBytes[fullBytes].toInt() and mask) == (candidateBytes[fullBytes].toInt() and mask)
+    }
+}
 
 data class DiscoveredBlueHopPeer(
     val serviceName: String,
@@ -43,6 +69,7 @@ class NsdPeerDiscovery(
     private val appContext = context.applicationContext
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val wifiManager = appContext.getSystemService(WifiManager::class.java)
+    private val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java)
     private val callbackExecutor = Dispatchers.IO.asExecutor()
 
     private val _peers = MutableStateFlow<List<DiscoveredBlueHopPeer>>(emptyList())
@@ -157,7 +184,8 @@ class NsdPeerDiscovery(
             }
 
             override fun onServiceUpdated(updatedInfo: NsdServiceInfo) {
-                val parsed = parseDiscoveredPeer(updatedInfo) ?: return
+                val localSubnets = localSubnetsFor(updatedInfo.network)
+                val parsed = parseDiscoveredPeer(updatedInfo, localSubnets) ?: return
                 if (excludedDeviceId != null && parsed.deviceId == excludedDeviceId) {
                     resolvedPeers.remove(name)
                 } else if (pairingOnlyFilter && !parsed.pairingAvailable) {
@@ -186,6 +214,69 @@ class NsdPeerDiscovery(
         }
     }
 
+    private fun localSubnetsFor(discoveredNetwork: Network?): List<LocalSubnet> {
+        val cm = connectivityManager
+        val fromLinkProperties = runCatching {
+            if (cm == null) return@runCatching emptyList()
+            val candidateNetworks = buildList {
+                if (discoveredNetwork != null) add(discoveredNetwork)
+                cm.activeNetwork?.let { active ->
+                    val caps = cm.getNetworkCapabilities(active)
+                    if (caps != null && (
+                            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                            )
+                    ) {
+                        add(active)
+                    }
+                }
+            }.distinct()
+            candidateNetworks.flatMap { network ->
+                cm.getLinkProperties(network)
+                    ?.linkAddresses
+                    .orEmpty()
+                    .mapNotNull { linkAddress ->
+                        val addr = linkAddress.address
+                        val prefix = linkAddress.prefixLength
+                        if (isUsableLocalIpAddress(addr) && prefix > 0) {
+                            LocalSubnet(addr, prefix)
+                        } else {
+                            null
+                        }
+                    }
+            }
+        }.getOrDefault(emptyList())
+
+        if (fromLinkProperties.isNotEmpty()) {
+            return fromLinkProperties.distinct()
+        }
+
+        return runCatching {
+            NetworkInterface.getNetworkInterfaces()
+                ?.toList()
+                .orEmpty()
+                .filter { it.isUp && !it.isLoopback }
+                .filterNot { iface ->
+                    val name = iface.name.orEmpty()
+                    name.contains("rmnet", ignoreCase = true) ||
+                        name.startsWith("ccmni", ignoreCase = true) ||
+                        name.startsWith("dummy", ignoreCase = true)
+                }
+                .flatMap { iface ->
+                    iface.interfaceAddresses.mapNotNull { ifaceAddr ->
+                        val addr = ifaceAddr.address ?: return@mapNotNull null
+                        val prefix = ifaceAddr.networkPrefixLength.toInt()
+                        if (isUsableLocalIpAddress(addr) && prefix > 0) {
+                            LocalSubnet(addr, prefix)
+                        } else {
+                            null
+                        }
+                    }
+                }
+                .distinct()
+        }.getOrDefault(emptyList())
+    }
+
     private fun publishPeers() {
         _peers.value = resolvedPeers.values
             .distinctBy { it.stableKey }
@@ -211,10 +302,13 @@ class NsdPeerDiscovery(
     companion object {
         private const val MULTICAST_LOCK_TAG = "bluehop:discovery"
 
-        internal fun parseDiscoveredPeer(serviceInfo: NsdServiceInfo): DiscoveredBlueHopPeer? {
+        internal fun parseDiscoveredPeer(
+            serviceInfo: NsdServiceInfo,
+            localSubnets: List<LocalSubnet> = emptyList(),
+        ): DiscoveredBlueHopPeer? {
             val port = serviceInfo.port
             if (port <= 0) return null
-            val hostAddress = selectPreferredHost(serviceInfo.hostAddresses) ?: return null
+            val hostAddress = selectPreferredHost(serviceInfo.hostAddresses, localSubnets) ?: return null
             val attrs = serviceInfo.attributes
             val deviceId = attrs["id"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
             val attrName = attrs["name"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
@@ -244,7 +338,24 @@ class NsdPeerDiscovery(
             )
         }
 
-        internal fun selectPreferredHost(addresses: List<InetAddress>): String? {
+        internal fun selectPreferredHost(
+            addresses: List<InetAddress>,
+            localSubnets: List<LocalSubnet> = emptyList(),
+        ): String? {
+            if (localSubnets.isNotEmpty()) {
+                bestMatchingSubnetHost(addresses, localSubnets) {
+                    it is Inet4Address && isUsableLocalIpAddress(it)
+                }?.let { return it }
+
+                bestMatchingSubnetHost(addresses, localSubnets) {
+                    it is Inet6Address && isUsableLocalIpAddress(it) && isUniqueLocalIpv6(it)
+                }?.let { return it }
+
+                bestMatchingSubnetHost(addresses, localSubnets) {
+                    it is Inet6Address && isUsableLocalIpAddress(it)
+                }?.let { return it }
+            }
+
             val ipv4 = addresses.firstOrNull {
                 it is Inet4Address && isUsableLocalIpAddress(it)
             }
@@ -263,6 +374,26 @@ class NsdPeerDiscovery(
             return addresses.firstOrNull { !it.isLoopbackAddress && !it.isLinkLocalAddress }?.hostAddress
                 ?: addresses.firstOrNull { !it.isLoopbackAddress }?.hostAddress
                 ?: addresses.firstOrNull()?.hostAddress
+        }
+
+        private fun bestMatchingSubnetHost(
+            addresses: List<InetAddress>,
+            localSubnets: List<LocalSubnet>,
+            allow: (InetAddress) -> Boolean,
+        ): String? {
+            var bestAddress: InetAddress? = null
+            var bestPrefix = -1
+            for (candidate in addresses) {
+                if (!allow(candidate)) continue
+                for (subnet in localSubnets) {
+                    if (!subnet.contains(candidate)) continue
+                    if (subnet.prefixLength > bestPrefix) {
+                        bestPrefix = subnet.prefixLength
+                        bestAddress = candidate
+                    }
+                }
+            }
+            return bestAddress?.hostAddress
         }
     }
 }
