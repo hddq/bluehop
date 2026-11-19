@@ -16,10 +16,12 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
 	"github.com/hddq/bluehop/linux/internal/holder"
+	"github.com/hddq/bluehop/linux/internal/mdns"
 	"github.com/hddq/bluehop/linux/internal/pairing"
 	"github.com/hddq/bluehop/linux/internal/peers"
 	"github.com/hddq/bluehop/linux/internal/protocol"
@@ -30,8 +32,10 @@ import (
 var version = "dev"
 
 type cliDeps struct {
-	openBluez   func() (bluez.Controller, error)
-	shutdownCtx context.Context
+	openBluez        func() (bluez.Controller, error)
+	startAdvertising func(mdns.AdvertiseConfig) (mdns.Advertiser, error)
+	discoverPeers    func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error)
+	shutdownCtx      context.Context
 }
 
 func defaultDeps() cliDeps {
@@ -39,6 +43,8 @@ func defaultDeps() cliDeps {
 		openBluez: func() (bluez.Controller, error) {
 			return bluez.ConnectSystem()
 		},
+		startAdvertising: mdns.StartAdvertising,
+		discoverPeers:    mdns.Discover,
 	}
 }
 
@@ -64,6 +70,7 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		fmt.Fprintln(stderr, "  devices     List paired Bluetooth devices via BlueZ")
 		fmt.Fprintln(stderr, "  connect     Connect to a paired Bluetooth device")
 		fmt.Fprintln(stderr, "  disconnect  Disconnect a paired Bluetooth device")
+		fmt.Fprintln(stderr, "  discover    Discover BlueHop hosts on the local network (mDNS)")
 		fmt.Fprintln(stderr, "  serve       Run the holder HTTP server (/status, /release)")
 		fmt.Fprintln(stderr, "  pair        Pair with another BlueHop host via ECDH + 6-digit SAS")
 		fmt.Fprintln(stderr, "  peers       List or remove paired hosts")
@@ -103,10 +110,12 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		return runBluetoothAction("connect", fs.Args()[1:], stdout, stderr, deps)
 	case "disconnect":
 		return runBluetoothAction("disconnect", fs.Args()[1:], stdout, stderr, deps)
+	case "discover":
+		return runDiscover(fs.Args()[1:], stdout, stderr, deps)
 	case "serve":
 		return runServe(fs.Args()[1:], stdout, stderr, deps)
 	case "pair":
-		return runPair(fs.Args()[1:], stdin, stdout, stderr)
+		return runPair(fs.Args()[1:], stdin, stdout, stderr, deps)
 	case "peers":
 		return runPeers(fs.Args()[1:], stdout, stderr)
 	default:
@@ -116,7 +125,7 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 	}
 }
 
-func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliDeps) int {
 	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listenMode := fs.Bool("listen", false, "Wait for an incoming pairing request and display the 6-digit SAS")
@@ -126,8 +135,8 @@ func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	timeoutFlag := fs.Duration("timeout", (protocol.PairingSessionTTLSec+15)*time.Second, "Pairing timeout")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  bluehop pair [options] <host:port>   Connect to a waiting host and verify SAS")
-		fmt.Fprintln(stderr, "  bluehop pair --listen [options]      Wait for a peer, verify SAS, and Accept/Reject")
+		fmt.Fprintln(stderr, "  bluehop pair [options] [<host:port>]  Discover or connect to a waiting host")
+		fmt.Fprintln(stderr, "  bluehop pair --listen [options]       Wait for a peer, verify SAS, and Accept/Reject")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
@@ -164,14 +173,71 @@ func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "unexpected arguments with --listen: %v\n", fs.Args())
 			return 2
 		}
-		return runPairServer(ctx, *listenAddr, identity, store, stdin, stdout, stderr)
+		return runPairServer(ctx, *listenAddr, identity, store, stdin, stdout, stderr, deps)
 	}
 
-	if fs.NArg() != 1 {
+	if fs.NArg() > 1 {
 		fs.Usage()
 		return 2
 	}
-	return runPairClient(ctx, fs.Arg(0), identity, store, stdout, stderr)
+	target := ""
+	if fs.NArg() == 1 {
+		target = fs.Arg(0)
+	} else {
+		var ok bool
+		target, ok = discoverPairingTarget(ctx, identity, stdin, stdout, stderr, deps)
+		if !ok {
+			return 1
+		}
+	}
+	return runPairClient(ctx, target, identity, store, stdout, stderr)
+}
+
+func discoverPairingTarget(
+	ctx context.Context,
+	identity peers.Identity,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	deps cliDeps,
+) (string, bool) {
+	if deps.discoverPeers == nil {
+		fmt.Fprintln(stderr, "mDNS discovery unavailable; pass <host:port> explicitly")
+		return "", false
+	}
+	fmt.Fprintln(stdout, "Searching for waiting BlueHop hosts via mDNS...")
+	discCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	found, err := deps.discoverPeers(discCtx, mdns.DiscoverOptions{
+		ExcludeDeviceID: identity.DeviceID,
+		PairingOnly:     true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "mDNS discovery failed: %v (pass <host:port> explicitly)\n", err)
+		return "", false
+	}
+	if len(found) == 0 {
+		fmt.Fprintln(stderr, "No BlueHop hosts advertising pairing on the LAN. Start pairing on the peer or pass <host:port>.")
+		return "", false
+	}
+	if len(found) == 1 {
+		fmt.Fprintf(stdout, "Discovered %s at %s\n", found[0].DisplayName, found[0].Endpoint())
+		return found[0].Endpoint(), true
+	}
+
+	fmt.Fprintln(stdout, "Discovered multiple pairing hosts:")
+	for i, p := range found {
+		fmt.Fprintf(stdout, "  [%d] %s (%s)\n", i+1, p.DisplayName, p.Endpoint())
+	}
+	fmt.Fprintf(stdout, "Select host [1-%d]: ", len(found))
+
+	line, _ := bufio.NewReader(stdin).ReadString('\n')
+	idx, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || idx < 1 || idx > len(found) {
+		fmt.Fprintln(stderr, "invalid host selection")
+		return "", false
+	}
+	return found[idx-1].Endpoint(), true
 }
 
 func runPairClient(
@@ -204,6 +270,7 @@ func runPairServer(
 	store *peers.Store,
 	stdin io.Reader,
 	stdout, stderr io.Writer,
+	deps cliDeps,
 ) int {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -281,7 +348,28 @@ func runPairServer(
 	}()
 
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	var adv mdns.Advertiser
+	if deps.startAdvertising != nil && !isLoopbackAddr(ln.Addr()) {
+		if port, convErr := strconv.Atoi(portStr); convErr == nil && port > 0 {
+			var advErr error
+			adv, advErr = deps.startAdvertising(mdns.AdvertiseConfig{
+				DeviceID:   identity.DeviceID,
+				DeviceName: identity.DeviceName,
+				Port:       port,
+				Pairing:    true,
+			})
+			if advErr != nil {
+				fmt.Fprintf(stderr, "warning: mDNS pairing advertisement failed: %v\n", advErr)
+			} else {
+				defer adv.Shutdown()
+			}
+		}
+	}
+
 	fmt.Fprintf(stdout, "Waiting for pairing request as %s on port %s\n", identity.DeviceName, portStr)
+	if adv != nil {
+		fmt.Fprintf(stdout, "Advertising pairing via mDNS as %q (%s)\n", mdns.BuildServiceName(identity.DeviceName, true), mdns.ServiceType)
+	}
 	for _, ep := range listeningEndpoints(listenAddr, ln.Addr()) {
 		fmt.Fprintf(stdout, "  %s\n", ep)
 	}
@@ -633,7 +721,28 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		return 1
 	}
 
+	var adv mdns.Advertiser
+	if deps.startAdvertising != nil && !isLoopbackAddr(srv.Addr()) {
+		connectedAddrs := connectedBluetoothAddresses(ctrl)
+		var advErr error
+		adv, advErr = deps.startAdvertising(mdns.AdvertiseConfig{
+			DeviceID:           identity.DeviceID,
+			DeviceName:         identity.DeviceName,
+			Port:               port,
+			ConnectedAddresses: connectedAddrs,
+			Pairing:            false,
+		})
+		if advErr != nil {
+			fmt.Fprintf(stderr, "warning: mDNS advertisement failed: %v\n", advErr)
+		} else {
+			defer adv.Shutdown()
+		}
+	}
+
 	fmt.Fprintf(stdout, "Serving BlueHop holder endpoints as %s (%s) on port %d\n", identity.DeviceName, identity.DeviceID, port)
+	if adv != nil {
+		fmt.Fprintf(stdout, "Advertising mDNS service %q (%s)\n", mdns.BuildServiceName(identity.DeviceName, false), mdns.ServiceType)
+	}
 	if addr := srv.Addr(); addr != nil {
 		for _, ep := range listeningEndpoints(*addrFlag, addr) {
 			fmt.Fprintf(stdout, "  http://%s\n", ep)
@@ -648,6 +757,10 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 	}
 	<-ctx.Done()
 
+	if adv != nil {
+		adv.Shutdown()
+	}
+
 	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := srv.Stop(stopCtx); err != nil {
@@ -655,6 +768,138 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		return 1
 	}
 	return 0
+}
+
+func runDiscover(args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	timeoutFlag := fs.Duration("timeout", 3*time.Second, "mDNS discovery duration")
+	pairingFlag := fs.Bool("pairing", false, "Only show hosts advertising pairing (pair=1)")
+	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  bluehop discover [options]")
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Options:")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return 2
+	}
+	if deps.discoverPeers == nil {
+		fmt.Fprintln(stderr, "mDNS discovery unavailable")
+		return 1
+	}
+
+	var excludeID string
+	pairedIDs := make(map[string]bool)
+	storePath, storeErr := resolveStorePath(*storeFlag)
+	if storeErr != nil {
+		if strings.TrimSpace(*storeFlag) != "" {
+			fmt.Fprintf(stderr, "resolve peer store path: %v\n", storeErr)
+			return 1
+		}
+	} else {
+		store := peers.NewStore(storePath)
+		if id, err := store.GetOrCreateIdentity(""); err == nil {
+			excludeID = id.DeviceID
+		}
+		if list, err := store.ListPeers(); err == nil {
+			for _, p := range list {
+				pairedIDs[p.PeerID] = true
+			}
+		}
+	}
+
+	ctx := deps.shutdownCtx
+	if ctx == nil {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
+	if *timeoutFlag > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeoutFlag)
+		defer cancel()
+	}
+
+	found, err := deps.discoverPeers(ctx, mdns.DiscoverOptions{
+		ExcludeDeviceID: excludeID,
+		PairingOnly:     *pairingFlag,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "discover BlueHop hosts: %v\n", err)
+		return 1
+	}
+	if len(found) == 0 {
+		if *pairingFlag {
+			fmt.Fprintln(stdout, "No BlueHop hosts advertising pairing found.")
+		} else {
+			fmt.Fprintln(stdout, "No BlueHop hosts found.")
+		}
+		return 0
+	}
+
+	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tENDPOINT\tMODE\tTRUST\tDEVICES\tID")
+	for _, p := range found {
+		mode := "holder"
+		if p.PairingAvailable {
+			mode = "pairing"
+		}
+		trust := "unpaired"
+		if p.DeviceID != "" && pairedIDs[p.DeviceID] {
+			trust = "paired"
+		}
+		devs := "-"
+		if len(p.ConnectedAddresses) > 0 {
+			devs = strings.Join(p.ConnectedAddresses, ",")
+		}
+		id := p.DeviceID
+		if id == "" {
+			id = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", p.DisplayName, p.Endpoint(), mode, trust, devs, id)
+	}
+	_ = tw.Flush()
+	return 0
+}
+
+func connectedBluetoothAddresses(ctrl bluez.Controller) []string {
+	if ctrl == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	devices, err := ctrl.ListDevices(ctx)
+	if err != nil {
+		return nil
+	}
+	var addrs []string
+	for _, d := range devices {
+		if d.Connected && strings.TrimSpace(d.Address) != "" {
+			addrs = append(addrs, d.Address)
+		}
+	}
+	return addrs
+}
+
+func isLoopbackAddr(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || tcpAddr.IP == nil {
+		return false
+	}
+	return tcpAddr.IP.IsLoopback()
 }
 
 func resolveStorePath(override string) (string, error) {

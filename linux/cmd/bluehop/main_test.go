@@ -16,11 +16,13 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
 	"github.com/hddq/bluehop/linux/internal/holder"
+	"github.com/hddq/bluehop/linux/internal/mdns"
 	"github.com/hddq/bluehop/linux/internal/peers"
 	"github.com/hddq/bluehop/linux/internal/protocol"
 )
@@ -603,4 +605,419 @@ func TestCLIServe(t *testing.T) {
 	if !ctrl.closed {
 		t.Fatalf("expected controller to close on serve exit")
 	}
+}
+
+type mockAdvertiser struct {
+	shutdownCalls atomic.Int32
+}
+
+func (m *mockAdvertiser) Shutdown() {
+	m.shutdownCalls.Add(1)
+}
+
+func TestCLIDiscover(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "peers.json")
+	store := peers.NewStore(storePath)
+	selfID, err := store.GetOrCreateIdentity("linux-host")
+	if err != nil {
+		t.Fatalf("GetOrCreateIdentity: %v", err)
+	}
+	if err := store.UpsertPeer(peers.Peer{
+		PeerID:           "phone-1",
+		PeerName:         "motorola edge",
+		PSKHex:           strings.Repeat("ab", 32),
+		PairedAtEpochSec: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("UpsertPeer: %v", err)
+	}
+
+	t.Run("lists discovered peers with paired status and devices", func(t *testing.T) {
+		var gotOpts mdns.DiscoverOptions
+		deps := cliDeps{
+			discoverPeers: func(_ context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+				gotOpts = opts
+				return []mdns.DiscoveredPeer{
+					{
+						Host:               "192.168.10.15",
+						Port:               8765,
+						DeviceID:           "phone-1",
+						DisplayName:        "motorola edge",
+						PairingAvailable:   false,
+						ConnectedAddresses: []string{"AC:80:0A:CD:82:A1"},
+					},
+					{
+						Host:             "192.168.10.22",
+						Port:             41234,
+						DeviceID:         "phone-2",
+						DisplayName:      "Pixel 9",
+						PairingAvailable: true,
+					},
+				}, nil
+			},
+		}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"discover", "--store", storePath, "--timeout", "1s"}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("discover exit=%d stderr=%q", code, stderr.String())
+		}
+		if gotOpts.ExcludeDeviceID != selfID.DeviceID || gotOpts.PairingOnly {
+			t.Fatalf("unexpected discover opts: %+v", gotOpts)
+		}
+		out := stdout.String()
+		for _, want := range []string{
+			"motorola edge", "192.168.10.15:8765", "holder", "paired", "AC:80:0A:CD:82:A1", "phone-1",
+			"Pixel 9", "192.168.10.22:41234", "pairing", "unpaired", "phone-2",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("expected %q in discover output:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("pairing filter and empty results", func(t *testing.T) {
+		var gotOpts mdns.DiscoverOptions
+		deps := cliDeps{
+			discoverPeers: func(_ context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+				gotOpts = opts
+				return nil, nil
+			},
+		}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"discover", "--pairing", "--store", storePath}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("discover --pairing exit=%d stderr=%q", code, stderr.String())
+		}
+		if !gotOpts.PairingOnly {
+			t.Fatalf("expected PairingOnly=true")
+		}
+		if !strings.Contains(stdout.String(), "No BlueHop hosts advertising pairing found.") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+
+		stdout.Reset()
+		code = runWithDeps([]string{"discover", "--store", storePath}, strings.NewReader(""), &stdout, &stderr, deps)
+		if code != 0 {
+			t.Fatalf("discover empty exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "No BlueHop hosts found.") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+	})
+
+	t.Run("extra argument returns usage error", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if code := runWithDeps([]string{"discover", "unexpected"}, strings.NewReader(""), &stdout, &stderr, cliDeps{}); code != 2 {
+			t.Fatalf("expected exit 2, got %d", code)
+		}
+	})
+}
+
+func TestCLIPairAutoDiscovery(t *testing.T) {
+	t.Run("auto-selects single discovered pairing peer", func(t *testing.T) {
+		dir := t.TempDir()
+		srvStore := filepath.Join(dir, "srv-peers.json")
+		cliStore := filepath.Join(dir, "cli-peers.json")
+
+		pr, pw := io.Pipe()
+		srvInR, srvInW := io.Pipe()
+		var srvStderr bytes.Buffer
+		srvCodeCh := make(chan int, 1)
+		go func() {
+			code := runWithDeps(
+				[]string{"pair", "--listen", "--addr", "127.0.0.1:0", "--name", "Phone Listener", "--store", srvStore, "--timeout", "10s"},
+				srvInR,
+				pw,
+				&srvStderr,
+				cliDeps{},
+			)
+			_ = pw.Close()
+			srvCodeCh <- code
+		}()
+
+		portCh := make(chan string, 1)
+		sasCh := make(chan string, 1)
+		go func() {
+			buf := make([]byte, 4096)
+			var acc string
+			portRe := regexp.MustCompile(`on port (\d+)`)
+			sasRe := regexp.MustCompile(`Verification code \(SAS\): (\d{3} \d{3})`)
+			portSent, sasSent := false, false
+			for {
+				n, err := pr.Read(buf)
+				if n > 0 {
+					acc += string(buf[:n])
+					if !portSent {
+						if m := portRe.FindStringSubmatch(acc); len(m) == 2 {
+							portSent = true
+							portCh <- m[1]
+						}
+					}
+					if !sasSent {
+						if m := sasRe.FindStringSubmatch(acc); len(m) == 2 {
+							sasSent = true
+							sasCh <- m[1]
+						}
+					}
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		portStr := <-portCh
+		var port int
+		_, _ = fmt.Sscanf(portStr, "%d", &port)
+
+		var cliStdout, cliStderr bytes.Buffer
+		cliCodeCh := make(chan int, 1)
+		go func() {
+			cliCodeCh <- runWithDeps(
+				[]string{"pair", "--name", "Linux Client", "--store", cliStore, "--timeout", "10s"},
+				strings.NewReader(""),
+				&cliStdout,
+				&cliStderr,
+				cliDeps{
+					discoverPeers: func(_ context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+						if !opts.PairingOnly {
+							return nil, errors.New("expected PairingOnly=true")
+						}
+						return []mdns.DiscoveredPeer{
+							{Host: "127.0.0.1", Port: port, DeviceID: "srv-1", DisplayName: "Phone Listener", PairingAvailable: true},
+						}, nil
+					},
+				},
+			)
+		}()
+
+		<-sasCh
+		_, _ = srvInW.Write([]byte("y\n"))
+		_ = srvInW.Close()
+
+		if code := <-srvCodeCh; code != 0 {
+			t.Fatalf("server exit=%d stderr=%q", code, srvStderr.String())
+		}
+		if code := <-cliCodeCh; code != 0 {
+			t.Fatalf("client exit=%d stderr=%q stdout=%q", code, cliStderr.String(), cliStdout.String())
+		}
+	})
+
+	t.Run("prompts when multiple pairing peers discovered", func(t *testing.T) {
+		dir := t.TempDir()
+		srvStore := filepath.Join(dir, "srv-peers.json")
+		cliStore := filepath.Join(dir, "cli-peers.json")
+
+		pr, pw := io.Pipe()
+		srvInR, srvInW := io.Pipe()
+		var srvStderr bytes.Buffer
+		srvCodeCh := make(chan int, 1)
+		go func() {
+			code := runWithDeps(
+				[]string{"pair", "--listen", "--addr", "127.0.0.1:0", "--name", "Phone Two", "--store", srvStore, "--timeout", "10s"},
+				srvInR,
+				pw,
+				&srvStderr,
+				cliDeps{},
+			)
+			_ = pw.Close()
+			srvCodeCh <- code
+		}()
+
+		portCh := make(chan string, 1)
+		sasCh := make(chan string, 1)
+		go func() {
+			buf := make([]byte, 4096)
+			var acc string
+			portRe := regexp.MustCompile(`on port (\d+)`)
+			sasRe := regexp.MustCompile(`Verification code \(SAS\): (\d{3} \d{3})`)
+			portSent, sasSent := false, false
+			for {
+				n, err := pr.Read(buf)
+				if n > 0 {
+					acc += string(buf[:n])
+					if !portSent {
+						if m := portRe.FindStringSubmatch(acc); len(m) == 2 {
+							portSent = true
+							portCh <- m[1]
+						}
+					}
+					if !sasSent {
+						if m := sasRe.FindStringSubmatch(acc); len(m) == 2 {
+							sasSent = true
+							sasCh <- m[1]
+						}
+					}
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		portStr := <-portCh
+		var port int
+		_, _ = fmt.Sscanf(portStr, "%d", &port)
+
+		var cliStdout, cliStderr bytes.Buffer
+		cliCodeCh := make(chan int, 1)
+		go func() {
+			cliCodeCh <- runWithDeps(
+				[]string{"pair", "--name", "Linux Client", "--store", cliStore, "--timeout", "10s"},
+				strings.NewReader("2\n"),
+				&cliStdout,
+				&cliStderr,
+				cliDeps{
+					discoverPeers: func(_ context.Context, _ mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+						return []mdns.DiscoveredPeer{
+							{Host: "127.0.0.1", Port: 1, DeviceID: "srv-unused", DisplayName: "Phone One", PairingAvailable: true},
+							{Host: "127.0.0.1", Port: port, DeviceID: "srv-2", DisplayName: "Phone Two", PairingAvailable: true},
+						}, nil
+					},
+				},
+			)
+		}()
+
+		<-sasCh
+		_, _ = srvInW.Write([]byte("y\n"))
+		_ = srvInW.Close()
+
+		if code := <-srvCodeCh; code != 0 {
+			t.Fatalf("server exit=%d stderr=%q", code, srvStderr.String())
+		}
+		if code := <-cliCodeCh; code != 0 {
+			t.Fatalf("client exit=%d stderr=%q stdout=%q", code, cliStderr.String(), cliStdout.String())
+		}
+	})
+
+	t.Run("returns error when no pairing hosts found", func(t *testing.T) {
+		dir := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps(
+			[]string{"pair", "--store", filepath.Join(dir, "peers.json")},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{
+				discoverPeers: func(_ context.Context, _ mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+					return nil, nil
+				},
+			},
+		)
+		if code != 1 {
+			t.Fatalf("expected exit 1, got %d", code)
+		}
+		if !strings.Contains(stderr.String(), "No BlueHop hosts advertising pairing") {
+			t.Fatalf("unexpected stderr=%q", stderr.String())
+		}
+	})
+}
+
+func TestCLIServeAndPairListenAdvertiseMDNS(t *testing.T) {
+	t.Run("serve advertises connected bluetooth addresses and shuts down", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		ctrl := &mockBluezController{
+			devices: []bluez.Device{
+				{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: true},
+				{Address: "11:22:33:44:55:66", Alias: "Keychron K2", Connected: false},
+			},
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var gotCfg mdns.AdvertiseConfig
+		adv := &mockAdvertiser{}
+		advStarted := make(chan struct{})
+
+		var stdout, stderr bytes.Buffer
+		codeCh := make(chan int, 1)
+		go func() {
+			codeCh <- runWithDeps(
+				[]string{"serve", "--addr", "0.0.0.0:0", "--name", "Linux Box", "--store", storePath},
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{
+					openBluez:   func() (bluez.Controller, error) { return ctrl, nil },
+					shutdownCtx: ctx,
+					startAdvertising: func(cfg mdns.AdvertiseConfig) (mdns.Advertiser, error) {
+						gotCfg = cfg
+						close(advStarted)
+						return adv, nil
+					},
+				},
+			)
+		}()
+
+		select {
+		case <-advStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for mDNS advertisement; stderr=%q", stderr.String())
+		}
+		cancel()
+
+		if code := <-codeCh; code != 0 {
+			t.Fatalf("serve exit=%d stderr=%q", code, stderr.String())
+		}
+		if gotCfg.Pairing {
+			t.Fatalf("expected Pairing=false for serve")
+		}
+		if gotCfg.DeviceName != "Linux Box" || gotCfg.Port <= 0 {
+			t.Fatalf("unexpected advertise config: %+v", gotCfg)
+		}
+		if !reflect.DeepEqual(gotCfg.ConnectedAddresses, []string{"AC:80:0A:CD:82:A1"}) {
+			t.Fatalf("ConnectedAddresses = %v, want [AC:80:0A:CD:82:A1]", gotCfg.ConnectedAddresses)
+		}
+		if adv.shutdownCalls.Load() == 0 {
+			t.Fatalf("expected advertiser Shutdown() to be called")
+		}
+	})
+
+	t.Run("pair --listen advertises pairing=true and shuts down", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+
+		var gotCfg mdns.AdvertiseConfig
+		adv := &mockAdvertiser{}
+		advStarted := make(chan struct{})
+
+		var stdout, stderr bytes.Buffer
+		codeCh := make(chan int, 1)
+		go func() {
+			codeCh <- runWithDeps(
+				[]string{"pair", "--listen", "--addr", "0.0.0.0:0", "--name", "Linux Pairer", "--store", storePath, "--timeout", "200ms"},
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{
+					startAdvertising: func(cfg mdns.AdvertiseConfig) (mdns.Advertiser, error) {
+						gotCfg = cfg
+						close(advStarted)
+						return adv, nil
+					},
+				},
+			)
+		}()
+
+		select {
+		case <-advStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for pairing mDNS advertisement; stderr=%q", stderr.String())
+		}
+
+		_ = <-codeCh // exits with timeout (1) because no peer connected
+		if !gotCfg.Pairing {
+			t.Fatalf("expected Pairing=true for pair --listen")
+		}
+		if gotCfg.DeviceName != "Linux Pairer" || gotCfg.Port <= 0 {
+			t.Fatalf("unexpected advertise config: %+v", gotCfg)
+		}
+		if adv.shutdownCalls.Load() == 0 {
+			t.Fatalf("expected advertiser Shutdown() to be called")
+		}
+	})
 }
