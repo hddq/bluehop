@@ -7,7 +7,10 @@ import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.SecureRandom
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECFieldFp
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import javax.crypto.KeyAgreement
@@ -172,20 +175,49 @@ class ProtocolVerifier(
     }
 }
 
+data class PairingKeys(
+    val psk: ByteArray,
+    val sas: String,
+    val confirmKey: ByteArray,
+) {
+    val pskHex: String
+        get() = HmacSigner.toHex(psk)
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PairingKeys) return false
+        return psk.contentEquals(other.psk) &&
+            sas == other.sas &&
+            confirmKey.contentEquals(other.confirmKey)
+    }
+
+    override fun hashCode(): Int {
+        var result = psk.contentHashCode()
+        result = 31 * result + sas.hashCode()
+        result = 31 * result + confirmKey.contentHashCode()
+        return result
+    }
+}
+
 object PairingCrypto {
     private const val EC_ALGORITHM = "EC"
     private const val EC_CURVE = "secp256r1"
     private const val ECDH_ALGORITHM = "ECDH"
     private const val HMAC_ALGORITHM = "HmacSHA256"
-    private const val PIN_DIGITS = 6
-    private const val PIN_BOUND = 1_000_000
-    private const val PSK_LENGTH = 32
+    private const val PAIRING_KEY_LENGTH = 32
+    private const val SAS_MODULUS = 1_000_000L
+    private const val SAS_DIGITS = 6
+    private const val TRANSCRIPT_LABEL = "bluehop-pair-v2"
+    private const val CONFIRM_LABEL = "bluehop-confirm-v2"
 
-    fun generatePin(random: SecureRandom = SecureRandom()): String =
-        random.nextInt(PIN_BOUND).toString().padStart(PIN_DIGITS, '0')
+    const val CONFIRM_ROLE_CLIENT = "client"
+    const val CONFIRM_ROLE_SERVER = "server"
 
-    fun normalizePin(pin: String): String =
-        pin.filter { it.isDigit() }
+    private val p256Params: ECParameterSpec by lazy {
+        val generator = KeyPairGenerator.getInstance(EC_ALGORITHM)
+        generator.initialize(ECGenParameterSpec(EC_CURVE))
+        (generator.generateKeyPair().public as ECPublicKey).params
+    }
 
     fun generateEphemeralKeyPair(random: SecureRandom = SecureRandom()): KeyPair {
         val generator = KeyPairGenerator.getInstance(EC_ALGORITHM)
@@ -198,7 +230,23 @@ object PairingCrypto {
 
     fun decodePublicKey(base64: String): PublicKey {
         val bytes = Base64.getDecoder().decode(base64)
-        return KeyFactory.getInstance(EC_ALGORITHM).generatePublic(X509EncodedKeySpec(bytes))
+        val key = KeyFactory.getInstance(EC_ALGORITHM).generatePublic(X509EncodedKeySpec(bytes))
+        val ecKey = key as? ECPublicKey ?: error("Public key is not an EC key")
+        require(isP256Params(ecKey.params)) {
+            "Public key is not on P-256"
+        }
+        return ecKey
+    }
+
+    private fun isP256Params(params: ECParameterSpec): Boolean {
+        val expectedField = p256Params.curve.field as? ECFieldFp ?: return false
+        val actualField = params.curve.field as? ECFieldFp ?: return false
+        return actualField.p == expectedField.p &&
+            params.curve.a == p256Params.curve.a &&
+            params.curve.b == p256Params.curve.b &&
+            params.generator == p256Params.generator &&
+            params.order == p256Params.order &&
+            params.cofactor == p256Params.cofactor
     }
 
     fun computeSharedSecret(privateKey: PrivateKey, peerPublicKey: PublicKey): ByteArray {
@@ -208,116 +256,100 @@ object PairingCrypto {
         return agreement.generateSecret()
     }
 
-    fun derivePairingPsk(
+    fun pairingTranscript(
+        sessionId: String,
+        clientPub: String,
+        serverPub: String,
+    ): String = "$TRANSCRIPT_LABEL\n$sessionId\n$clientPub\n$serverPub"
+
+    fun derivePairingKeys(
         sharedSecret: ByteArray,
-        pin: String,
-        sessionNonce: String,
-        firstId: String,
-        secondId: String,
-    ): ByteArray {
-        val normalizedPin = normalizePin(pin)
-        require(normalizedPin.length == PIN_DIGITS) { "PIN must be $PIN_DIGITS digits" }
-        val (idLow, idHigh) = if (firstId <= secondId) firstId to secondId else secondId to firstId
+        sessionId: String,
+        clientPub: String,
+        serverPub: String,
+    ): PairingKeys {
+        require(sharedSecret.isNotEmpty()) { "Shared secret must not be empty" }
         val salt = MessageDigest.getInstance("SHA-256").digest(
-            "bluehop-pin-v1\n$normalizedPin\n$sessionNonce".toByteArray(Charsets.UTF_8),
+            pairingTranscript(sessionId = sessionId, clientPub = clientPub, serverPub = serverPub)
+                .toByteArray(Charsets.UTF_8),
         )
-        val info = "bluehop-pair-v1\n$idLow\n$idHigh\n$sessionNonce".toByteArray(Charsets.UTF_8)
-        return hkdfSha256(ikm = sharedSecret, salt = salt, info = info, length = PSK_LENGTH)
+        val psk = hkdfSha256(
+            ikm = sharedSecret,
+            salt = salt,
+            info = "$TRANSCRIPT_LABEL psk".toByteArray(Charsets.UTF_8),
+            length = PAIRING_KEY_LENGTH,
+        )
+        val confirmKey = hkdfSha256(
+            ikm = sharedSecret,
+            salt = salt,
+            info = "$TRANSCRIPT_LABEL confirm".toByteArray(Charsets.UTF_8),
+            length = PAIRING_KEY_LENGTH,
+        )
+        val sasBytes = hkdfSha256(
+            ikm = sharedSecret,
+            salt = salt,
+            info = "$TRANSCRIPT_LABEL sas".toByteArray(Charsets.UTF_8),
+            length = 4,
+        )
+        return PairingKeys(
+            psk = psk,
+            sas = sasFromBytes(sasBytes),
+            confirmKey = confirmKey,
+        )
     }
 
-    fun clientProofPayload(
-        sessionNonce: String,
-        requesterId: String,
-        responderId: String,
-        requesterPublicKeyBase64: String,
-        responderPublicKeyBase64: String,
-    ): String =
-        "pair-client-v1\n$sessionNonce\n$requesterId\n$responderId\n$requesterPublicKeyBase64\n$responderPublicKeyBase64"
+    fun sasFromBytes(bytes: ByteArray): String {
+        require(bytes.size >= 4) { "Expected at least 4 bytes for SAS" }
+        val value = ((bytes[0].toLong() and 0xFFL) shl 24) or
+            ((bytes[1].toLong() and 0xFFL) shl 16) or
+            ((bytes[2].toLong() and 0xFFL) shl 8) or
+            (bytes[3].toLong() and 0xFFL)
+        return (value % SAS_MODULUS).toString().padStart(SAS_DIGITS, '0')
+    }
 
-    fun serverProofPayload(
-        sessionNonce: String,
+    fun confirmPayload(
+        role: String,
+        sessionId: String,
         requesterId: String,
         responderId: String,
-        requesterPublicKeyBase64: String,
-        responderPublicKeyBase64: String,
-    ): String =
-        "pair-server-v1\n$sessionNonce\n$requesterId\n$responderId\n$requesterPublicKeyBase64\n$responderPublicKeyBase64"
+    ): String = "$CONFIRM_LABEL\n$role\n$sessionId\n$requesterId\n$responderId"
 
-    fun computeClientProof(
-        psk: ByteArray,
-        sessionNonce: String,
+    fun computeConfirm(
+        confirmKey: ByteArray,
+        role: String,
+        sessionId: String,
         requesterId: String,
         responderId: String,
-        requesterPublicKeyBase64: String,
-        responderPublicKeyBase64: String,
     ): String = HmacSigner.sign(
-        psk = psk,
-        payload = clientProofPayload(
-            sessionNonce = sessionNonce,
+        psk = confirmKey,
+        payload = confirmPayload(
+            role = role,
+            sessionId = sessionId,
             requesterId = requesterId,
             responderId = responderId,
-            requesterPublicKeyBase64 = requesterPublicKeyBase64,
-            responderPublicKeyBase64 = responderPublicKeyBase64,
         ),
     )
 
-    fun verifyClientProof(
-        psk: ByteArray,
-        sessionNonce: String,
+    fun verifyConfirm(
+        confirmKey: ByteArray,
+        role: String,
+        sessionId: String,
         requesterId: String,
         responderId: String,
-        requesterPublicKeyBase64: String,
-        responderPublicKeyBase64: String,
-        proofHex: String,
+        macHex: String,
     ): Boolean = HmacSigner.verify(
-        psk = psk,
-        payload = clientProofPayload(
-            sessionNonce = sessionNonce,
+        psk = confirmKey,
+        payload = confirmPayload(
+            role = role,
+            sessionId = sessionId,
             requesterId = requesterId,
             responderId = responderId,
-            requesterPublicKeyBase64 = requesterPublicKeyBase64,
-            responderPublicKeyBase64 = responderPublicKeyBase64,
         ),
-        signatureHex = proofHex,
+        signatureHex = macHex,
     )
 
-    fun computeServerProof(
-        psk: ByteArray,
-        sessionNonce: String,
-        requesterId: String,
-        responderId: String,
-        requesterPublicKeyBase64: String,
-        responderPublicKeyBase64: String,
-    ): String = HmacSigner.sign(
-        psk = psk,
-        payload = serverProofPayload(
-            sessionNonce = sessionNonce,
-            requesterId = requesterId,
-            responderId = responderId,
-            requesterPublicKeyBase64 = requesterPublicKeyBase64,
-            responderPublicKeyBase64 = responderPublicKeyBase64,
-        ),
-    )
-
-    fun verifyServerProof(
-        psk: ByteArray,
-        sessionNonce: String,
-        requesterId: String,
-        responderId: String,
-        requesterPublicKeyBase64: String,
-        responderPublicKeyBase64: String,
-        proofHex: String,
-    ): Boolean = HmacSigner.verify(
-        psk = psk,
-        payload = serverProofPayload(
-            sessionNonce = sessionNonce,
-            requesterId = requesterId,
-            responderId = responderId,
-            requesterPublicKeyBase64 = requesterPublicKeyBase64,
-            responderPublicKeyBase64 = responderPublicKeyBase64,
-        ),
-        signatureHex = proofHex,
-    )
+    fun isValidSingleLineField(value: String): Boolean =
+        value.isNotBlank() && '\n' !in value && '\r' !in value
 
     internal fun hkdfSha256(
         ikm: ByteArray,

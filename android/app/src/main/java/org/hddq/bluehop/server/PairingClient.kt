@@ -8,9 +8,10 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
-import org.hddq.bluehop.protocol.PROTOCOL_VERSION
-import org.hddq.bluehop.protocol.PairRequest
-import org.hddq.bluehop.protocol.PairResponseStatus
+import org.hddq.bluehop.protocol.PAIRING_PROTOCOL_VERSION
+import org.hddq.bluehop.protocol.PairConfirmRequest
+import org.hddq.bluehop.protocol.PairSessionStatus
+import org.hddq.bluehop.protocol.PairStartRequest
 import org.hddq.bluehop.protocol.PairedPeer
 import org.hddq.bluehop.protocol.PairingCrypto
 import org.hddq.bluehop.protocol.ProtocolJson
@@ -23,6 +24,7 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.URI
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 class PairingClient(
@@ -30,94 +32,136 @@ class PairingClient(
     private val connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS,
     private val totalTimeoutMs: Int = DEFAULT_TOTAL_TIMEOUT_MS,
+    private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
 ) {
     suspend fun pairWithHost(
         host: String,
         port: Int,
-        pin: String,
         localIdentity: LocalDeviceIdentity,
+        onSasReady: (sas: String, responderName: String) -> Unit = { _, _ -> },
     ): Result<PairedPeer> = withContext(Dispatchers.IO) {
         try {
             require(totalTimeoutMs > 0) { "Total timeout must be positive" }
+            require(pollIntervalMs > 0L) { "Poll interval must be positive" }
             val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(totalTimeoutMs.toLong())
 
-            val normalizedPin = PairingCrypto.normalizePin(pin)
-            require(normalizedPin.length == 6) { "Enter the 6-digit pairing code" }
-
             val baseUrl = formatBaseUrl(host, port)
-            val infoHttpResponse = get("$baseUrl/pair/info", deadlineNanos)
-            if (infoHttpResponse.statusCode !in 200..299) {
-                val errMsg = runCatching {
-                    ProtocolJson.decodePairResponse(infoHttpResponse.body).message
-                }.getOrNull()
-                error(errMsg?.ifBlank { null } ?: "Host rejected pairing info (${infoHttpResponse.statusCode})")
+            val myKeyPair = PairingCrypto.generateEphemeralKeyPair()
+            val clientPubBase64 = PairingCrypto.encodePublicKey(myKeyPair.public)
+
+            val startRequest = PairStartRequest(
+                version = PAIRING_PROTOCOL_VERSION,
+                requesterId = localIdentity.deviceId,
+                requesterName = localIdentity.deviceName,
+                clientPub = clientPubBase64,
+            )
+            val startHttpResponse = postJson(
+                url = "$baseUrl/pair/start",
+                jsonBody = ProtocolJson.encodePairStartRequest(startRequest),
+                deadlineNanos = deadlineNanos,
+            )
+            if (startHttpResponse.statusCode !in 200..299) {
+                error(extractErrorMessage(startHttpResponse, "Host rejected pairing start"))
             }
 
-            val info = ProtocolJson.decodePairInfo(infoHttpResponse.body)
-            require(info.version == PROTOCOL_VERSION) {
-                "Unsupported protocol version ${info.version}"
+            val startResponse = ProtocolJson.decodePairStartResponse(startHttpResponse.body)
+            require(startResponse.version == PAIRING_PROTOCOL_VERSION) {
+                "Unsupported pairing version ${startResponse.version}"
             }
-            require(info.responderId != localIdentity.deviceId) {
+            require(
+                PairingCrypto.isValidSingleLineField(startResponse.sessionId) &&
+                    PairingCrypto.isValidSingleLineField(startResponse.responderId) &&
+                    startResponse.responderId == startResponse.responderId.trim() &&
+                    PairingCrypto.isValidSingleLineField(startResponse.responderName) &&
+                    PairingCrypto.isValidSingleLineField(startResponse.serverPub),
+            ) {
+                "Incomplete pairing start response"
+            }
+            require(startResponse.responderId != localIdentity.deviceId) {
                 "Cannot pair device with itself"
             }
 
-            val responderPub = PairingCrypto.decodePublicKey(info.responderPublicKeyBase64)
-            val myKeyPair = PairingCrypto.generateEphemeralKeyPair()
-            val myPubBase64 = PairingCrypto.encodePublicKey(myKeyPair.public)
-            val sharedSecret = PairingCrypto.computeSharedSecret(myKeyPair.private, responderPub)
-            val derivedPsk = PairingCrypto.derivePairingPsk(
+            val serverPubKey = PairingCrypto.decodePublicKey(startResponse.serverPub)
+            val sharedSecret = PairingCrypto.computeSharedSecret(myKeyPair.private, serverPubKey)
+            val keys = PairingCrypto.derivePairingKeys(
                 sharedSecret = sharedSecret,
-                pin = normalizedPin,
-                sessionNonce = info.sessionNonce,
-                firstId = localIdentity.deviceId,
-                secondId = info.responderId,
+                sessionId = startResponse.sessionId,
+                clientPub = clientPubBase64,
+                serverPub = startResponse.serverPub,
             )
+            val responderName = startResponse.responderName.trim()
+            onSasReady(keys.sas, responderName)
 
-            val clientProof = PairingCrypto.computeClientProof(
-                psk = derivedPsk,
-                sessionNonce = info.sessionNonce,
-                requesterId = localIdentity.deviceId,
-                responderId = info.responderId,
-                requesterPublicKeyBase64 = myPubBase64,
-                responderPublicKeyBase64 = info.responderPublicKeyBase64,
-            )
-
-            val pairRequest = PairRequest(
-                version = PROTOCOL_VERSION,
-                requesterId = localIdentity.deviceId,
-                requesterName = localIdentity.deviceName,
-                requesterPublicKeyBase64 = myPubBase64,
-                sessionNonce = info.sessionNonce,
-                proof = clientProof,
-            )
-
-            val pairHttpResponse = postJson(
-                url = "$baseUrl/pair",
-                jsonBody = ProtocolJson.encodePairRequest(pairRequest),
-                deadlineNanos = deadlineNanos,
-            )
-
-            val pairResponse = ProtocolJson.decodePairResponse(pairHttpResponse.body)
-            if (pairHttpResponse.statusCode != 200 || pairResponse.status != PairResponseStatus.OK) {
-                error(pairResponse.message.ifBlank { "Pairing rejected (${pairHttpResponse.statusCode})" })
+            val encodedSessionId = URLEncoder.encode(startResponse.sessionId, Charsets.UTF_8)
+            val statusUrl = "$baseUrl/pair/status?sessionId=$encodedSessionId"
+            while (true) {
+                val statusHttpResponse = get(statusUrl, deadlineNanos)
+                if (statusHttpResponse.statusCode !in 200..299) {
+                    error(extractErrorMessage(statusHttpResponse, "Pairing status check failed"))
+                }
+                val statusResponse = ProtocolJson.decodePairStatusResponse(statusHttpResponse.body)
+                require(
+                    statusResponse.version == PAIRING_PROTOCOL_VERSION &&
+                        statusResponse.sessionId == startResponse.sessionId,
+                ) {
+                    "Mismatched pairing status response"
+                }
+                when (statusResponse.status) {
+                    PairSessionStatus.APPROVED -> break
+                    PairSessionStatus.REJECTED -> error("Pairing rejected by host")
+                    PairSessionStatus.EXPIRED -> error("Pairing session expired")
+                    PairSessionStatus.PENDING -> {
+                        val remainingMs = remainingMillis(deadlineNanos).toLong()
+                        delay(minOf(pollIntervalMs, remainingMs))
+                    }
+                }
             }
 
-            val serverProofValid = PairingCrypto.verifyServerProof(
-                psk = derivedPsk,
-                sessionNonce = info.sessionNonce,
+            val clientConfirm = PairingCrypto.computeConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_CLIENT,
+                sessionId = startResponse.sessionId,
                 requesterId = localIdentity.deviceId,
-                responderId = info.responderId,
-                requesterPublicKeyBase64 = myPubBase64,
-                responderPublicKeyBase64 = info.responderPublicKeyBase64,
-                proofHex = pairResponse.proof,
+                responderId = startResponse.responderId,
             )
-            check(serverProofValid) { "Host proof verification failed" }
+            val confirmHttpResponse = postJson(
+                url = "$baseUrl/pair/confirm",
+                jsonBody = ProtocolJson.encodePairConfirmRequest(
+                    PairConfirmRequest(
+                        version = PAIRING_PROTOCOL_VERSION,
+                        sessionId = startResponse.sessionId,
+                        clientConfirm = clientConfirm,
+                    ),
+                ),
+                deadlineNanos = deadlineNanos,
+            )
+            if (confirmHttpResponse.statusCode !in 200..299) {
+                error(extractErrorMessage(confirmHttpResponse, "Pairing confirmation failed"))
+            }
+
+            val confirmResponse = ProtocolJson.decodePairConfirmResponse(confirmHttpResponse.body)
+            require(
+                confirmResponse.version == PAIRING_PROTOCOL_VERSION &&
+                    confirmResponse.sessionId == startResponse.sessionId,
+            ) {
+                "Mismatched pairing confirmation response"
+            }
+
+            val serverConfirmValid = PairingCrypto.verifyConfirm(
+                confirmKey = keys.confirmKey,
+                role = PairingCrypto.CONFIRM_ROLE_SERVER,
+                sessionId = startResponse.sessionId,
+                requesterId = localIdentity.deviceId,
+                responderId = startResponse.responderId,
+                macHex = confirmResponse.serverConfirm,
+            )
+            check(serverConfirmValid) { "Host key confirmation failed" }
 
             Result.success(
                 PairedPeer(
-                    peerId = info.responderId,
-                    peerName = pairResponse.responderName.ifBlank { info.responderName },
-                    psk = derivedPsk,
+                    peerId = startResponse.responderId,
+                    peerName = responderName,
+                    psk = keys.psk,
                     pairedAtEpochSec = nowEpochSeconds(),
                 ),
             )
@@ -126,6 +170,13 @@ class PairingClient(
         } catch (error: Throwable) {
             Result.failure(error)
         }
+    }
+
+    private fun extractErrorMessage(response: SimpleHttpResponse, fallback: String): String {
+        val parsed = runCatching {
+            ProtocolJson.decodePairErrorResponse(response.body).message.trim()
+        }.getOrNull()
+        return if (!parsed.isNullOrEmpty()) parsed else "$fallback (${response.statusCode})"
     }
 
     private suspend fun get(url: String, deadlineNanos: Long): SimpleHttpResponse =
@@ -143,6 +194,7 @@ class PairingClient(
         val initialRemainingMs = remainingMillis(deadlineNanos)
         val connection = (URI.create(url).toURL().openConnection() as HttpURLConnection).apply {
             requestMethod = method
+            instanceFollowRedirects = false
             connectTimeout = minOf(connectTimeoutMs, initialRemainingMs)
             readTimeout = minOf(readTimeoutMs, initialRemainingMs)
             useCaches = false
@@ -225,7 +277,8 @@ class PairingClient(
     companion object {
         const val DEFAULT_CONNECT_TIMEOUT_MS = 4_000
         const val DEFAULT_READ_TIMEOUT_MS = 5_000
-        const val DEFAULT_TOTAL_TIMEOUT_MS = 15_000
+        const val DEFAULT_TOTAL_TIMEOUT_MS = 75_000
+        const val DEFAULT_POLL_INTERVAL_MS = 500L
         const val MAX_RESPONSE_BYTES = 64 * 1024
 
         internal fun formatHostPort(host: String, port: Int): String {

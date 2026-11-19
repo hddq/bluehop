@@ -102,5 +102,28 @@
       "expectedValid": false,
       "expectedReason": "NONCE_MISMATCH"
     }
-  ]
+  ],
+  "pairing": {
+    "pairingVersion": 2,
+    "sessionId": "5f1d3c9a0b7e4d2c8a6f1e0d9c8b7a65",
+    "requesterId": "linux-laptop",
+    "responderId": "pixel-9",
+    "clientPrivateKeyHex": "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721",
+    "serverPrivateKeyHex": "519b423d715f8b581f4fa8ee59f4771a5b44c8130b4e3eacca54a56dda72b464",
+    "clientPub": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYP7UuiVanTHJYet0xjVtaMBJuJI7Yfps5mliLmDyn7Z5A/4QCLi8maQa6elWKLxk8vGyDC1+n1F3o8KU1EYimQ==",
+    "serverPub": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHMvpHAdfx/TwM7+iSNuPzNNWXelLv7EvPFn/RsJxv4POQBTGiBH5ohof2ywOYRPgbbfKk7dATnjcfM1cqJpMqQ==",
+    "sharedSecretHex": "874cc88baf56772eba61b4ccb240ed93d96f2345b346d0e7f9d58a3a555535d0",
+    "pskHex": "bc77661763ea6281104ee31f9134d98f3073f27185eb90330a6a5159fbf1c4ac",
+    "confirmKeyHex": "74f590a38e0478a5de16b155765602f953c1e74e17e51b67e28c8047c52c59d3",
+    "sas": "152415",
+    "clientConfirm": "6279967ac372e121ad32ba33f8cd4f10164479e9dcf2b8994fbe70611f4f6e0d",
+    "serverConfirm": "7ccda3de151ac4a5ab9886572c9f5b145211012337eb342f3bf3ba840943fff1",
+    "sasCases": [
+      { "bytesHex": "00000000", "sas": "000000" },
+      { "bytesHex": "0000002a", "sas": "000042" },
+      { "bytesHex": "000f423f", "sas": "999999" },
+      { "bytesHex": "000f4240", "sas": "000000" },
+      { "bytesHex": "ffffffff", "sas": "967295" }
+    ]
+  }
 }

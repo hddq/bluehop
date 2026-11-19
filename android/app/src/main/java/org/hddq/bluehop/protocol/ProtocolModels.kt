@@ -1,10 +1,12 @@
 package org.hddq.bluehop.protocol
 
+import kotlinx.serialization.Required
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 const val PROTOCOL_VERSION = 1
+const val PAIRING_PROTOCOL_VERSION = 2
 
 @Serializable
 data class GrabRequest(
@@ -61,44 +63,62 @@ sealed interface VerificationResult {
 }
 
 @Serializable
-data class PairInfoResponse(
-    val version: Int = PROTOCOL_VERSION,
-    val responderId: String,
-    val responderName: String,
-    val responderPublicKeyBase64: String,
-    val sessionNonce: String,
-)
+enum class PairSessionStatus(val wireValue: String) {
+    @SerialName("pending")
+    PENDING("pending"),
 
-@Serializable
-data class PairRequest(
-    val version: Int = PROTOCOL_VERSION,
-    val requesterId: String,
-    val requesterName: String,
-    val requesterPublicKeyBase64: String,
-    val sessionNonce: String,
-    val proof: String,
-)
-
-@Serializable
-enum class PairResponseStatus(val wireValue: String) {
-    @SerialName("ok")
-    OK("ok"),
+    @SerialName("approved")
+    APPROVED("approved"),
 
     @SerialName("rejected")
     REJECTED("rejected"),
 
-    @SerialName("error")
-    ERROR("error"),
+    @SerialName("expired")
+    EXPIRED("expired"),
 }
 
 @Serializable
-data class PairResponse(
-    val version: Int = PROTOCOL_VERSION,
-    val status: PairResponseStatus,
+data class PairStartRequest(
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
+    val requesterId: String,
+    val requesterName: String,
+    val clientPub: String,
+)
+
+@Serializable
+data class PairStartResponse(
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
+    val sessionId: String,
     val responderId: String,
     val responderName: String,
-    val proof: String = "",
-    val message: String = "",
+    val serverPub: String,
+)
+
+@Serializable
+data class PairStatusResponse(
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
+    val sessionId: String,
+    val status: PairSessionStatus,
+)
+
+@Serializable
+data class PairConfirmRequest(
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
+    val sessionId: String,
+    val clientConfirm: String,
+)
+
+@Serializable
+data class PairConfirmResponse(
+    @Required val version: Int = PAIRING_PROTOCOL_VERSION,
+    val sessionId: String,
+    val serverConfirm: String,
+)
+
+@Serializable
+data class PairErrorResponse(
+    val version: Int = PAIRING_PROTOCOL_VERSION,
+    val message: String,
 )
 
 object ProtocolJson {
@@ -115,15 +135,27 @@ object ProtocolJson {
 
     fun decodeResponse(json: String): GrabResponse = codec.decodeFromString(json)
 
-    fun encodePairInfo(info: PairInfoResponse): String = codec.encodeToString(info)
+    fun encodePairStartRequest(request: PairStartRequest): String = codec.encodeToString(request)
 
-    fun decodePairInfo(json: String): PairInfoResponse = codec.decodeFromString(json)
+    fun decodePairStartRequest(json: String): PairStartRequest = codec.decodeFromString(json)
 
-    fun encodePairRequest(request: PairRequest): String = codec.encodeToString(request)
+    fun encodePairStartResponse(response: PairStartResponse): String = codec.encodeToString(response)
 
-    fun decodePairRequest(json: String): PairRequest = codec.decodeFromString(json)
+    fun decodePairStartResponse(json: String): PairStartResponse = codec.decodeFromString(json)
 
-    fun encodePairResponse(response: PairResponse): String = codec.encodeToString(response)
+    fun encodePairStatusResponse(response: PairStatusResponse): String = codec.encodeToString(response)
 
-    fun decodePairResponse(json: String): PairResponse = codec.decodeFromString(json)
+    fun decodePairStatusResponse(json: String): PairStatusResponse = codec.decodeFromString(json)
+
+    fun encodePairConfirmRequest(request: PairConfirmRequest): String = codec.encodeToString(request)
+
+    fun decodePairConfirmRequest(json: String): PairConfirmRequest = codec.decodeFromString(json)
+
+    fun encodePairConfirmResponse(response: PairConfirmResponse): String = codec.encodeToString(response)
+
+    fun decodePairConfirmResponse(json: String): PairConfirmResponse = codec.decodeFromString(json)
+
+    fun encodePairErrorResponse(response: PairErrorResponse): String = codec.encodeToString(response)
+
+    fun decodePairErrorResponse(json: String): PairErrorResponse = codec.decodeFromString(json)
 }

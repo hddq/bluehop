@@ -35,6 +35,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
@@ -45,6 +46,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -58,7 +60,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
@@ -67,6 +68,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
@@ -76,7 +78,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.hddq.bluehop.protocol.LocalDeviceIdentity
 import org.hddq.bluehop.protocol.PairedPeersRepository
-import org.hddq.bluehop.protocol.PairingCrypto
 import org.hddq.bluehop.server.DiscoveredBlueHopPeer
 import org.hddq.bluehop.server.NsdAdvertiser
 import org.hddq.bluehop.server.NsdPeerDiscovery
@@ -91,8 +92,8 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 
 enum class PairingMode {
-    SHOW_CODE,
-    ENTER_CODE,
+    RECEIVE,
+    CONNECT,
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -103,17 +104,23 @@ fun PairingDialog(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    var mode by rememberSaveable { mutableStateOf(PairingMode.SHOW_CODE) }
+    var mode by rememberSaveable { mutableStateOf(PairingMode.RECEIVE) }
     var localIdentity by remember { mutableStateOf<LocalDeviceIdentity?>(null) }
     var localAddresses by remember { mutableStateOf<List<String>>(emptyList()) }
 
     var selectedPeerKey by rememberSaveable { mutableStateOf<String?>(null) }
     var useManualAddress by rememberSaveable { mutableStateOf(false) }
     var manualAddressInput by rememberSaveable { mutableStateOf("") }
-    var pinInput by rememberSaveable { mutableStateOf("") }
     var isPairing by remember { mutableStateOf(false) }
+    var clientSas by remember { mutableStateOf<String?>(null) }
+    var clientResponderName by remember { mutableStateOf<String?>(null) }
     var clientError by remember { mutableStateOf<String?>(null) }
     var clientPairedName by remember { mutableStateOf<String?>(null) }
+    val pairingJobHolder = remember {
+        object {
+            var job: Job? = null
+        }
+    }
 
     val pairingClient = remember { PairingClient() }
 
@@ -130,12 +137,18 @@ fun PairingDialog(
     val sessionState by sessionServer.state.collectAsStateWithLifecycle()
     val discoveredPeers by nsdDiscovery.peers.collectAsStateWithLifecycle()
 
+    DisposableEffect(Unit) {
+        onDispose {
+            pairingJobHolder.job?.cancel()
+        }
+    }
+
     LaunchedEffect(sessionServer) {
         val identity = pairedPeersRepository.getOrCreateIdentity()
         localIdentity = identity
         snapshotFlow { mode }.collectLatest { activeMode ->
             when (activeMode) {
-                PairingMode.SHOW_CODE -> {
+                PairingMode.RECEIVE -> {
                     try {
                         withContext(Dispatchers.IO) {
                             val port = sessionServer.start()
@@ -155,7 +168,7 @@ fun PairingDialog(
                     }
                 }
 
-                PairingMode.ENTER_CODE -> {
+                PairingMode.CONNECT -> {
                     try {
                         withContext(Dispatchers.IO) {
                             nsdDiscovery.start(
@@ -174,7 +187,7 @@ fun PairingDialog(
         }
     }
 
-    val isWaitingForPeer = mode == PairingMode.SHOW_CODE &&
+    val isWaitingForPeer = mode == PairingMode.RECEIVE &&
         sessionState is PairingSessionState.WaitingForPeer
     LaunchedEffect(isWaitingForPeer, context) {
         if (!isWaitingForPeer) {
@@ -252,30 +265,35 @@ fun PairingDialog(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     SegmentedButton(
-                        selected = mode == PairingMode.SHOW_CODE,
+                        selected = mode == PairingMode.RECEIVE,
                         onClick = {
-                            mode = PairingMode.SHOW_CODE
+                            pairingJobHolder.job?.cancel()
+                            pairingJobHolder.job = null
+                            isPairing = false
+                            clientSas = null
+                            clientResponderName = null
+                            mode = PairingMode.RECEIVE
                             clientError = null
                         },
                         shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
                         label = {
                             Text(
-                                text = stringResource(R.string.pairing_mode_show_code),
+                                text = stringResource(R.string.pairing_mode_receive),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
                         },
                     )
                     SegmentedButton(
-                        selected = mode == PairingMode.ENTER_CODE,
+                        selected = mode == PairingMode.CONNECT,
                         onClick = {
-                            mode = PairingMode.ENTER_CODE
+                            mode = PairingMode.CONNECT
                             clientError = null
                         },
                         shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
                         label = {
                             Text(
-                                text = stringResource(R.string.pairing_mode_enter_code),
+                                text = stringResource(R.string.pairing_mode_connect),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -284,22 +302,33 @@ fun PairingDialog(
                 }
 
                 when (mode) {
-                    PairingMode.SHOW_CODE -> {
-                        ShowCodeContent(
+                    PairingMode.RECEIVE -> {
+                        ReceivePairingContent(
                             deviceName = localIdentity?.deviceName.orEmpty(),
                             localAddresses = localAddresses,
                             sessionState = sessionState,
+                            onApprove = { sessionId ->
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    sessionServer.approveSession(sessionId)
+                                }
+                            },
+                            onReject = { sessionId ->
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    sessionServer.rejectSession(sessionId)
+                                }
+                            },
                         )
                     }
 
-                    PairingMode.ENTER_CODE -> {
-                        EnterCodeContent(
+                    PairingMode.CONNECT -> {
+                        ConnectPairingContent(
                             discoveredPeers = discoveredPeers,
                             selectedPeerKey = selectedPeerKey,
                             useManualAddress = useManualAddress,
                             manualAddressInput = manualAddressInput,
-                            pinInput = pinInput,
                             isPairing = isPairing,
+                            sasCode = clientSas,
+                            responderName = clientResponderName,
                             errorMessage = clientError,
                             pairedPeerName = clientPairedName,
                             onPeerSelect = { peer ->
@@ -325,20 +354,15 @@ fun PairingDialog(
                                 }
                                 clientError = null
                             },
-                            onPinChange = { raw ->
-                                pinInput = PairingCrypto.normalizePin(raw).take(6)
-                                clientError = null
-                            },
                         )
                     }
                 }
             }
         },
         confirmButton = {
-            if (mode == PairingMode.ENTER_CODE && clientPairedName == null) {
+            if (mode == PairingMode.CONNECT && clientPairedName == null) {
                 val canSubmit = !isPairing &&
                     localIdentity != null &&
-                    pinInput.length == 6 &&
                     if (usingManualEntry) {
                         manualAddressInput.isNotBlank()
                     } else {
@@ -364,20 +388,30 @@ fun PairingDialog(
                             targetHost = target.host
                             targetPort = target.port
                         }
+                        pairingJobHolder.job?.cancel()
                         isPairing = true
+                        clientSas = null
+                        clientResponderName = null
                         clientError = null
-                        coroutineScope.launch {
+                        pairingJobHolder.job = coroutineScope.launch {
                             try {
                                 val result = pairingClient.pairWithHost(
                                     host = targetHost,
                                     port = targetPort,
-                                    pin = pinInput,
                                     localIdentity = identity,
+                                    onSasReady = { sas, responderName ->
+                                        clientSas = sas
+                                        clientResponderName = responderName
+                                    },
                                 )
                                 result.onSuccess { peer ->
                                     pairedPeersRepository.upsertPeer(peer)
                                     clientPairedName = peer.peerName
+                                    clientSas = null
+                                    clientResponderName = null
                                 }.onFailure { error ->
+                                    clientSas = null
+                                    clientResponderName = null
                                     clientError = error.message ?: "Pairing failed"
                                 }
                             } finally {
@@ -388,18 +422,19 @@ fun PairingDialog(
                 ) {
                     Text(text = stringResource(R.string.pairing_action_connect_pair))
                 }
-            } else if (mode == PairingMode.SHOW_CODE &&
-                sessionState is PairingSessionState.LockedOut
+            } else if (mode == PairingMode.RECEIVE &&
+                (sessionState is PairingSessionState.Rejected ||
+                    sessionState is PairingSessionState.Expired)
             ) {
                 FilledTonalButton(
                     shapes = ButtonDefaults.shapes(),
                     onClick = {
                         coroutineScope.launch(Dispatchers.IO) {
-                            sessionServer.regenerateSession()
+                            sessionServer.resetSession()
                         }
                     },
                 ) {
-                    Text(text = stringResource(R.string.pairing_action_new_code))
+                    Text(text = stringResource(R.string.pairing_action_try_again))
                 }
             }
         },
@@ -413,10 +448,12 @@ fun PairingDialog(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ShowCodeContent(
+private fun ReceivePairingContent(
     deviceName: String,
     localAddresses: List<String>,
     sessionState: PairingSessionState,
+    onApprove: (String) -> Unit,
+    onReject: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -431,7 +468,7 @@ private fun ShowCodeContent(
                 ) {
                     LoadingIndicator(modifier = Modifier.size(24.dp))
                     Text(
-                        text = stringResource(R.string.pairing_show_waiting),
+                        text = stringResource(R.string.pairing_receive_waiting),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -439,30 +476,16 @@ private fun ShowCodeContent(
             }
 
             is PairingSessionState.WaitingForPeer -> {
-                Text(
-                    text = stringResource(R.string.pairing_show_waiting),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Surface(
-                    shape = MaterialTheme.shapes.large,
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.fillMaxWidth(),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 16.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = formatPin(sessionState.pin),
-                            style = MaterialTheme.typography.displaySmall.copy(
-                                fontFamily = FontFamily.Monospace,
-                            ),
-                        )
-                    }
+                    LoadingIndicator(modifier = Modifier.size(24.dp))
+                    Text(
+                        text = stringResource(R.string.pairing_receive_waiting),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 if (deviceName.isNotBlank()) {
                     Text(
@@ -565,53 +588,77 @@ private fun ShowCodeContent(
                         }
                     }
                 }
-                if (sessionState.attemptsRemaining < PairingSessionServer.DEFAULT_MAX_ATTEMPTS) {
+            }
+
+            is PairingSessionState.PendingConfirmation -> {
+                Text(
+                    text = stringResource(
+                        R.string.pairing_receive_confirm_prompt,
+                        sessionState.requesterName,
+                    ),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                SasCodeCard(sas = sessionState.sas)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = { onReject(sessionState.sessionId) },
+                        shapes = ButtonDefaults.shapes(),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(text = stringResource(R.string.pairing_action_reject))
+                    }
+                    Button(
+                        onClick = { onApprove(sessionState.sessionId) },
+                        shapes = ButtonDefaults.shapes(),
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(text = stringResource(R.string.pairing_action_accept))
+                    }
+                }
+            }
+
+            is PairingSessionState.ApprovedWaitingForConfirm -> {
+                SasCodeCard(sas = sessionState.sas)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    LoadingIndicator(modifier = Modifier.size(20.dp))
                     Text(
-                        text = pluralStringResource(
-                            R.plurals.pairing_show_attempts_left,
-                            sessionState.attemptsRemaining,
-                            sessionState.attemptsRemaining,
+                        text = stringResource(
+                            R.string.pairing_receive_confirming,
+                            sessionState.requesterName,
                         ),
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
 
-            is PairingSessionState.LockedOut -> {
+            is PairingSessionState.Rejected -> {
                 Text(
-                    text = stringResource(R.string.pairing_show_locked_out),
+                    text = sessionState.message.ifBlank {
+                        stringResource(R.string.pairing_receive_rejected)
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            is PairingSessionState.Expired -> {
+                Text(
+                    text = stringResource(R.string.pairing_receive_expired),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error,
                 )
             }
 
             is PairingSessionState.Completed -> {
-                Surface(
-                    shape = MaterialTheme.shapes.large,
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_check),
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp),
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            text = stringResource(
-                                R.string.pairing_status_success,
-                                sessionState.peer.peerName,
-                            ),
-                            style = MaterialTheme.typography.titleMedium,
-                        )
-                    }
-                }
+                PairedSuccessCard(peerName = sessionState.peer.peerName)
             }
         }
     }
@@ -619,20 +666,20 @@ private fun ShowCodeContent(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun EnterCodeContent(
+private fun ConnectPairingContent(
     discoveredPeers: List<DiscoveredBlueHopPeer>,
     selectedPeerKey: String?,
     useManualAddress: Boolean,
     manualAddressInput: String,
-    pinInput: String,
     isPairing: Boolean,
+    sasCode: String?,
+    responderName: String?,
     errorMessage: String?,
     pairedPeerName: String?,
     onPeerSelect: (DiscoveredBlueHopPeer) -> Unit,
     onManualAddressSelect: () -> Unit,
     onManualAddressFocus: () -> Unit,
     onManualAddressChange: (String) -> Unit,
-    onPinChange: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -640,27 +687,33 @@ private fun EnterCodeContent(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (pairedPeerName != null) {
-            Surface(
-                shape = MaterialTheme.shapes.large,
-                color = MaterialTheme.colorScheme.primaryContainer,
-                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                modifier = Modifier.fillMaxWidth(),
+            PairedSuccessCard(peerName = pairedPeerName)
+            return@Column
+        }
+
+        if (isPairing && sasCode != null) {
+            Text(
+                text = stringResource(
+                    R.string.pairing_connect_sas_prompt,
+                    responderName.orEmpty(),
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            SasCodeCard(sas = sasCode)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_check),
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text(
-                        text = stringResource(R.string.pairing_status_success, pairedPeerName),
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                }
+                LoadingIndicator(modifier = Modifier.size(20.dp))
+                Text(
+                    text = stringResource(
+                        R.string.pairing_receive_confirming,
+                        responderName.orEmpty(),
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             return@Column
         }
@@ -672,7 +725,7 @@ private fun EnterCodeContent(
             ) {
                 LoadingIndicator(modifier = Modifier.size(24.dp))
                 Text(
-                    text = stringResource(R.string.pairing_enter_searching),
+                    text = stringResource(R.string.pairing_connect_searching),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -806,7 +859,7 @@ private fun EnterCodeContent(
                 enabled = !isPairing,
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Uri,
-                    imeAction = ImeAction.Next,
+                    imeAction = ImeAction.Done,
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -817,19 +870,6 @@ private fun EnterCodeContent(
                     },
             )
         }
-
-        OutlinedTextField(
-            value = pinInput,
-            onValueChange = onPinChange,
-            label = { Text(text = stringResource(R.string.pairing_enter_pin_label)) },
-            singleLine = true,
-            enabled = !isPairing,
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Number,
-                imeAction = ImeAction.Done,
-            ),
-            modifier = Modifier.fillMaxWidth(),
-        )
 
         if (isPairing) {
             Row(
@@ -853,8 +893,64 @@ private fun EnterCodeContent(
     }
 }
 
-private fun formatPin(pin: String): String =
-    if (pin.length == 6) "${pin.substring(0, 3)} ${pin.substring(3, 6)}" else pin
+@Composable
+private fun SasCodeCard(
+    sas: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 16.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = formatSas(sas),
+                style = MaterialTheme.typography.displaySmall.copy(
+                    fontFamily = FontFamily.Monospace,
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun PairedSuccessCard(
+    peerName: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.primaryContainer,
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_check),
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = stringResource(R.string.pairing_status_success, peerName),
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
+    }
+}
+
+private fun formatSas(sas: String): String =
+    if (sas.length == 6) "${sas.substring(0, 3)} ${sas.substring(3, 6)}" else sas
 
 internal fun resolveLocalIpAddresses(context: Context): List<String> {
     val excludedLinkAddresses = mutableSetOf<InetAddress>()
