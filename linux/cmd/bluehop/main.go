@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
+	"github.com/hddq/bluehop/linux/internal/grab"
 	"github.com/hddq/bluehop/linux/internal/holder"
 	"github.com/hddq/bluehop/linux/internal/mdns"
 	"github.com/hddq/bluehop/linux/internal/pairing"
@@ -35,6 +36,7 @@ type cliDeps struct {
 	openBluez        func() (bluez.Controller, error)
 	startAdvertising func(mdns.AdvertiseConfig) (mdns.Advertiser, error)
 	discoverPeers    func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error)
+	newHolderClient  func() grab.HolderClient
 	shutdownCtx      context.Context
 }
 
@@ -45,6 +47,9 @@ func defaultDeps() cliDeps {
 		},
 		startAdvertising: mdns.StartAdvertising,
 		discoverPeers:    mdns.Discover,
+		newHolderClient: func() grab.HolderClient {
+			return grab.NewHTTPClient(grab.HTTPClientConfig{})
+		},
 	}
 }
 
@@ -67,6 +72,7 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		fmt.Fprintln(stderr, "Usage: bluehop <command> [options]")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Commands:")
+		fmt.Fprintln(stderr, "  grab        Release a Bluetooth device from another host and connect here")
 		fmt.Fprintln(stderr, "  devices     List paired Bluetooth devices via BlueZ")
 		fmt.Fprintln(stderr, "  connect     Connect to a paired Bluetooth device")
 		fmt.Fprintln(stderr, "  disconnect  Disconnect a paired Bluetooth device")
@@ -104,6 +110,8 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 			return 1
 		}
 		return 0
+	case "grab":
+		return runGrab(fs.Args()[1:], stdout, stderr, deps)
 	case "devices":
 		return runDevices(fs.Args()[1:], stdout, stderr, deps)
 	case "connect":
@@ -660,6 +668,118 @@ func runBluetoothAction(action string, args []string, stdout, stderr io.Writer, 
 		return 1
 	}
 	fmt.Fprintf(stdout, "Disconnected from %s (%s)\n", dev.DisplayName(), dev.Address)
+	return 0
+}
+
+type discovererFunc func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error)
+
+func (f discovererFunc) Discover(ctx context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+	return f(ctx, opts)
+}
+
+func runGrab(args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	fs := flag.NewFlagSet("grab", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	discoverTimeout := fs.Duration("discover-timeout", grab.DefaultDiscoveryTimeout, "mDNS discovery timeout")
+	timeoutFlag := fs.Duration("timeout", 45*time.Second, "Overall grab operation timeout")
+	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
+	nameFlag := fs.String("name", "", "Local device name override")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  bluehop grab [options] <mac-or-name>")
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Options:")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return 2
+	}
+
+	storePath, err := resolveStorePath(*storeFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "resolve peer store path: %v\n", err)
+		return 1
+	}
+	store := peers.NewStore(storePath)
+	identity, err := store.GetOrCreateIdentity(*nameFlag)
+	if err != nil {
+		fmt.Fprintf(stderr, "load local identity: %v\n", err)
+		return 1
+	}
+	pairedPeers, err := store.ListPeers()
+	if err != nil {
+		fmt.Fprintf(stderr, "load paired peers: %v\n", err)
+		return 1
+	}
+
+	ctrl, err := deps.openBluez()
+	if err != nil {
+		fmt.Fprintf(stderr, "open BlueZ controller: %v\n", err)
+		return 1
+	}
+	defer ctrl.Close()
+
+	ctx := deps.shutdownCtx
+	if ctx == nil {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
+	if *timeoutFlag > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeoutFlag)
+		defer cancel()
+	}
+
+	var disc mdns.Discoverer
+	if deps.discoverPeers != nil {
+		disc = discovererFunc(deps.discoverPeers)
+	}
+	var holderClient grab.HolderClient
+	if deps.newHolderClient != nil {
+		holderClient = deps.newHolderClient()
+	}
+
+	res, err := grab.Grab(ctx, grab.Options{
+		Target:           fs.Arg(0),
+		Identity:         identity,
+		Peers:            pairedPeers,
+		Controller:       ctrl,
+		Discoverer:       disc,
+		HolderClient:     holderClient,
+		DiscoveryTimeout: *discoverTimeout,
+		OnProgress: func(p grab.Progress) {
+			switch p.Stage {
+			case grab.StageSearching:
+				fmt.Fprintln(stdout, "Searching for BlueHop peers on LAN...")
+			case grab.StageReleasing:
+				fmt.Fprintf(stdout, "Releasing %s (%s) from %s...\n", p.Device.DisplayName(), p.Device.Address, p.HolderName)
+			case grab.StageConnecting:
+				fmt.Fprintf(stdout, "Connecting to %s (%s)...\n", p.Device.DisplayName(), p.Device.Address)
+			}
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
+	if res.AlreadyConnected {
+		fmt.Fprintf(stdout, "%s (%s) is already connected\n", res.Device.DisplayName(), res.Device.Address)
+		return 0
+	}
+	if res.ReleasedFrom != "" {
+		fmt.Fprintf(stdout, "Connected to %s (%s) (released from %s)\n", res.Device.DisplayName(), res.Device.Address, res.ReleasedFrom)
+		return 0
+	}
+	fmt.Fprintf(stdout, "Connected to %s (%s)\n", res.Device.DisplayName(), res.Device.Address)
 	return 0
 }
 

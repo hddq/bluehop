@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
+	"github.com/hddq/bluehop/linux/internal/grab"
 	"github.com/hddq/bluehop/linux/internal/holder"
 	"github.com/hddq/bluehop/linux/internal/mdns"
 	"github.com/hddq/bluehop/linux/internal/peers"
@@ -1018,6 +1019,139 @@ func TestCLIServeAndPairListenAdvertiseMDNS(t *testing.T) {
 		}
 		if adv.shutdownCalls.Load() == 0 {
 			t.Fatalf("expected advertiser Shutdown() to be called")
+		}
+	})
+}
+
+func TestCLIGrab(t *testing.T) {
+	t.Run("releases from holder server and connects locally", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		store := peers.NewStore(storePath)
+		selfID, err := store.GetOrCreateIdentity("nix-client")
+		if err != nil {
+			t.Fatalf("GetOrCreateIdentity: %v", err)
+		}
+
+		psk := make([]byte, 32)
+		for i := range psk {
+			psk[i] = byte(i + 3)
+		}
+		if err := store.UpsertPeer(peers.Peer{
+			PeerID:           "phone-1",
+			PeerName:         "motorola edge",
+			PSKHex:           hex.EncodeToString(psk),
+			PairedAtEpochSec: time.Now().Unix(),
+		}); err != nil {
+			t.Fatalf("UpsertPeer: %v", err)
+		}
+
+		holderCtrl := &mockBluezController{
+			devices: []bluez.Device{
+				{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: true},
+			},
+		}
+		holderSrv := holder.NewServer(holder.Config{
+			Identity: peers.Identity{DeviceID: "phone-1", DeviceName: "motorola edge"},
+			Backend:  holder.NewBluezBackend(holderCtrl),
+			PeerPSKLookup: func(id string) ([]byte, error) {
+				if id == selfID.DeviceID {
+					return psk, nil
+				}
+				return nil, errors.New("unknown")
+			},
+			PollInterval: 10 * time.Millisecond,
+		})
+		port, err := holderSrv.Start("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("holderSrv.Start: %v", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = holderSrv.Stop(ctx)
+		}()
+
+		localCtrl := &mockBluezController{
+			devices: []bluez.Device{
+				{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: false},
+			},
+		}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps(
+			[]string{"grab", "--store", storePath, "WH-1000XM4"},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{
+				openBluez: func() (bluez.Controller, error) { return localCtrl, nil },
+				discoverPeers: func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+					return []mdns.DiscoveredPeer{
+						{
+							Host:               "127.0.0.1",
+							Port:               port,
+							DeviceID:           "phone-1",
+							DisplayName:        "motorola edge",
+							ConnectedAddresses: []string{"AC:80:0A:CD:82:A1"},
+						},
+					}, nil
+				},
+				newHolderClient: func() grab.HolderClient {
+					return grab.NewHTTPClient(grab.HTTPClientConfig{})
+				},
+			},
+		)
+		if code != 0 {
+			t.Fatalf("grab exit=%d stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+		}
+		out := stdout.String()
+		for _, want := range []string{
+			"Searching for BlueHop peers on LAN...",
+			"Releasing WH-1000XM4 (AC:80:0A:CD:82:A1) from motorola edge...",
+			"Connecting to WH-1000XM4 (AC:80:0A:CD:82:A1)...",
+			"Connected to WH-1000XM4 (AC:80:0A:CD:82:A1) (released from motorola edge)",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("expected %q in grab stdout:\n%s", want, out)
+			}
+		}
+		if holderCtrl.devices[0].Connected {
+			t.Fatalf("expected holder controller device to be disconnected")
+		}
+		if !localCtrl.devices[0].Connected {
+			t.Fatalf("expected local controller device to be connected")
+		}
+	})
+
+	t.Run("already connected locally and missing arg", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		ctrl := &mockBluezController{
+			devices: []bluez.Device{
+				{Address: "AC:80:0A:CD:82:A1", Alias: "WH-1000XM4", Connected: true},
+			},
+		}
+
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps(
+			[]string{"grab", "--store", storePath, "AC:80:0A:CD:82:A1"},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+		)
+		if code != 0 {
+			t.Fatalf("grab exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "WH-1000XM4 (AC:80:0A:CD:82:A1) is already connected") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		if code := runWithDeps([]string{"grab"}, strings.NewReader(""), &stdout, &stderr, cliDeps{}); code != 2 {
+			t.Fatalf("expected exit 2 for missing arg, got %d", code)
 		}
 	})
 }
