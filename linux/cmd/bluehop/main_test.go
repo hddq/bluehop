@@ -33,8 +33,46 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if code := run([]string{"--help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("expected exit 0 for --help, got %d (stderr=%q)", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Usage: bluehop") {
-		t.Fatalf("expected usage in stderr, got %q", stderr.String())
+	helpOut := stderr.String()
+	if !strings.Contains(helpOut, "Usage: bluehop") {
+		t.Fatalf("expected usage in stderr, got %q", helpOut)
+	}
+	if strings.Contains(helpOut, "Options:") {
+		t.Fatalf("did not expect empty Options section in root help, got %q", helpOut)
+	}
+	for _, removed := range []string{"  connect ", "  disconnect ", "  discover "} {
+		if strings.Contains(helpOut, removed) {
+			t.Fatalf("did not expect removed command %q in root help:\n%s", removed, helpOut)
+		}
+	}
+
+	stderr.Reset()
+	if code := run([]string{"-h"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("expected exit 0 for -h, got %d (stderr=%q)", code, stderr.String())
+	}
+
+	// Verify GNU-style flags on subcommands (--listen / -l) and rejection of Go single-dash long flags (-listen).
+	stderr.Reset()
+	if code := run([]string{"pair", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("expected exit 0 for pair --help, got %d (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-l, --listen") {
+		t.Fatalf("expected GNU '-l, --listen' flag in pair help, got %q", stderr.String())
+	}
+
+	stderr.Reset()
+	if code := run([]string{"pair", "-listen"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected exit 2 for Go-style -listen flag, got %d (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "error:") || !strings.Contains(stderr.String(), "Usage:") {
+		t.Fatalf("expected error message and usage on invalid flag, got %q", stderr.String())
+	}
+
+	for _, removedCmd := range []string{"connect", "disconnect", "discover"} {
+		stderr.Reset()
+		if code := run([]string{removedCmd}, &stdout, &stderr); code != 2 {
+			t.Fatalf("expected exit 2 for removed command %q, got %d", removedCmd, code)
+		}
 	}
 
 	stdout.Reset()
@@ -51,6 +89,192 @@ func TestRunHelpAndVersion(t *testing.T) {
 	if code := run([]string{"version", "extra"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected exit 2 for extra args on version, got %d", code)
 	}
+}
+
+func TestCLISingleDashLongFlagRejection(t *testing.T) {
+	t.Run("rejects registered single-dash long flags before reaching command execution", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			args     []string
+			wantHint string
+		}{
+			{
+				name:     "grab -name before positional",
+				args:     []string{"grab", "-name", "Keyboard"},
+				wantHint: "--name",
+			},
+			{
+				name:     "grab -name=value",
+				args:     []string{"grab", "-name=MyPC", "Keyboard"},
+				wantHint: "--name",
+			},
+			{
+				name:     "grab interspersed -store after positional",
+				args:     []string{"grab", "Keyboard", "-store", "/tmp/peers.json"},
+				wantHint: "--store",
+			},
+			{
+				name:     "grab -discover-timeout",
+				args:     []string{"grab", "-discover-timeout", "5s", "Keyboard"},
+				wantHint: "--discover-timeout",
+			},
+			{
+				name:     "pair -listen",
+				args:     []string{"pair", "-listen"},
+				wantHint: "--listen",
+			},
+			{
+				name:     "pair -addr",
+				args:     []string{"pair", "-addr", ":8765"},
+				wantHint: "--addr",
+			},
+			{
+				name:     "serve -store",
+				args:     []string{"serve", "-store", "/tmp/peers.json"},
+				wantHint: "--store",
+			},
+			{
+				name:     "devices -timeout",
+				args:     []string{"devices", "-timeout", "2s"},
+				wantHint: "--timeout",
+			},
+			{
+				name:     "peers -store before subcommand",
+				args:     []string{"peers", "-store", "/tmp/peers.json", "list"},
+				wantHint: "--store",
+			},
+			{
+				name:     "peers scan -pairing",
+				args:     []string{"peers", "scan", "-pairing"},
+				wantHint: "--pairing",
+			},
+			{
+				name:     "peers scan after valid short flag",
+				args:     []string{"peers", "scan", "-p", "-timeout", "1s"},
+				wantHint: "--timeout",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				bluezOpened := false
+				discoverCalled := false
+				deps := cliDeps{
+					openBluez: func() (bluez.Controller, error) {
+						bluezOpened = true
+						return nil, errors.New("should not open bluez")
+					},
+					discoverPeers: func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+						discoverCalled = true
+						return nil, errors.New("should not discover peers")
+					},
+				}
+
+				var stdout, stderr bytes.Buffer
+				code := runWithDeps(tc.args, strings.NewReader(""), &stdout, &stderr, deps)
+				if code != 2 {
+					t.Fatalf("args=%v exit=%d, want 2 (stderr=%q)", tc.args, code, stderr.String())
+				}
+				if bluezOpened {
+					t.Fatalf("args=%v unexpectedly opened BlueZ controller", tc.args)
+				}
+				if discoverCalled {
+					t.Fatalf("args=%v unexpectedly invoked discovery", tc.args)
+				}
+				if !strings.Contains(stderr.String(), tc.wantHint) || !strings.Contains(stderr.String(), "Usage:") {
+					t.Fatalf("args=%v expected hint %q and usage in stderr, got %q", tc.args, tc.wantHint, stderr.String())
+				}
+			})
+		}
+	})
+
+	t.Run("preserves valid short options, option values, interspersed flags, and -- terminator", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+
+		newCtrl := func(alias string) *mockBluezController {
+			return &mockBluezController{
+				devices: []bluez.Device{
+					{Address: "AA:BB:CC:DD:EE:01", Alias: alias, Connected: true},
+				},
+			}
+		}
+
+		// Attached short option value (-nMyHost) and interspersed -s after positional arg.
+		var stdout, stderr bytes.Buffer
+		ctrl := newCtrl("Keyboard")
+		code := runWithDeps(
+			[]string{"grab", "-nMyHost", "Keyboard", "-s", storePath},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+		)
+		if code != 0 {
+			t.Fatalf("attached short flag failed: exit=%d stderr=%q", code, stderr.String())
+		}
+
+		// Option values matching registered single-dash long flag spellings (-n -name, --name -store).
+		for _, args := range [][]string{
+			{"grab", "-n", "-name", "-s", storePath, "Keyboard"},
+			{"grab", "--name", "-store", "-s", storePath, "Keyboard"},
+		} {
+			stdout.Reset()
+			stderr.Reset()
+			ctrl = newCtrl("Keyboard")
+			code = runWithDeps(
+				args,
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+			)
+			if code != 0 {
+				t.Fatalf("option value args=%v failed: exit=%d stderr=%q", args, code, stderr.String())
+			}
+		}
+
+		// -- terminator allows a positional argument literally named "-name".
+		stdout.Reset()
+		stderr.Reset()
+		ctrl = newCtrl("-name")
+		code = runWithDeps(
+			[]string{"grab", "-s", storePath, "--", "-name"},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+		)
+		if code != 0 {
+			t.Fatalf("-- terminator failed: exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "-name (AA:BB:CC:DD:EE:01) is already connected") {
+			t.Fatalf("unexpected stdout for -- -name: %q", stdout.String())
+		}
+
+		// Combined short options (-ps <store>) on peers scan.
+		stdout.Reset()
+		stderr.Reset()
+		var gotOpts mdns.DiscoverOptions
+		code = runWithDeps(
+			[]string{"peers", "scan", "-ps", storePath},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{
+				discoverPeers: func(_ context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+					gotOpts = opts
+					return nil, nil
+				},
+			},
+		)
+		if code != 0 {
+			t.Fatalf("peers scan -ps failed: exit=%d stderr=%q", code, stderr.String())
+		}
+		if !gotOpts.PairingOnly {
+			t.Fatalf("expected PairingOnly=true for -ps")
+		}
+	})
 }
 
 func TestFormatBuildVersion(t *testing.T) {
@@ -388,18 +612,18 @@ func (m *mockBluezController) Close() error {
 	return nil
 }
 
-func TestCLIDevicesConnectDisconnect(t *testing.T) {
+func TestCLIDevices(t *testing.T) {
 	sample := []bluez.Device{
 		{Address: "AA:BB:CC:DD:EE:01", Alias: "Keychron K2", Connected: false},
 		{Address: "AA:BB:CC:DD:EE:02", Alias: "WH-1000XM5", Connected: true},
 	}
 
-	t.Run("devices lists paired devices", func(t *testing.T) {
+	t.Run("devices lists paired devices with short timeout flag", func(t *testing.T) {
 		ctrl := &mockBluezController{devices: sample}
 		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
 
 		var stdout, stderr bytes.Buffer
-		code := runWithDeps([]string{"devices"}, strings.NewReader(""), &stdout, &stderr, deps)
+		code := runWithDeps([]string{"devices", "-t", "2s"}, strings.NewReader(""), &stdout, &stderr, deps)
 		if code != 0 {
 			t.Fatalf("devices exit=%d stderr=%q", code, stderr.String())
 		}
@@ -426,65 +650,17 @@ func TestCLIDevicesConnectDisconnect(t *testing.T) {
 		}
 	})
 
-	t.Run("connect success and already connected", func(t *testing.T) {
-		ctrl := &mockBluezController{devices: sample}
-		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
-
-		var stdout, stderr bytes.Buffer
-		code := runWithDeps([]string{"connect", "Keychron K2"}, strings.NewReader(""), &stdout, &stderr, deps)
-		if code != 0 {
-			t.Fatalf("connect exit=%d stderr=%q", code, stderr.String())
-		}
-		if !strings.Contains(stdout.String(), "Connected to Keychron K2 (AA:BB:CC:DD:EE:01)") {
-			t.Fatalf("unexpected stdout=%q", stdout.String())
-		}
-
-		stdout.Reset()
-		ctrl.connectErr = fmt.Errorf("%w: WH-1000XM5", bluez.ErrAlreadyConnected)
-		code = runWithDeps([]string{"connect", "AA:BB:CC:DD:EE:02"}, strings.NewReader(""), &stdout, &stderr, deps)
-		if code != 0 {
-			t.Fatalf("already connected exit=%d stderr=%q", code, stderr.String())
-		}
-		if !strings.Contains(stdout.String(), "WH-1000XM5 (AA:BB:CC:DD:EE:02) is already connected") {
-			t.Fatalf("unexpected stdout=%q", stdout.String())
-		}
-	})
-
-	t.Run("disconnect success and already disconnected", func(t *testing.T) {
-		ctrl := &mockBluezController{devices: sample}
-		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
-
-		var stdout, stderr bytes.Buffer
-		code := runWithDeps([]string{"disconnect", "WH-1000XM5"}, strings.NewReader(""), &stdout, &stderr, deps)
-		if code != 0 {
-			t.Fatalf("disconnect exit=%d stderr=%q", code, stderr.String())
-		}
-		if !strings.Contains(stdout.String(), "Disconnected from WH-1000XM5 (AA:BB:CC:DD:EE:02)") {
-			t.Fatalf("unexpected stdout=%q", stdout.String())
-		}
-
-		stdout.Reset()
-		ctrl.disconnectErr = fmt.Errorf("%w: Keychron K2", bluez.ErrNotConnected)
-		code = runWithDeps([]string{"disconnect", "Keychron K2"}, strings.NewReader(""), &stdout, &stderr, deps)
-		if code != 0 {
-			t.Fatalf("already disconnected exit=%d stderr=%q", code, stderr.String())
-		}
-		if !strings.Contains(stdout.String(), "Keychron K2 (AA:BB:CC:DD:EE:01) is already disconnected") {
-			t.Fatalf("unexpected stdout=%q", stdout.String())
-		}
-	})
-
 	t.Run("error cases return non-zero", func(t *testing.T) {
-		ctrl := &mockBluezController{devices: sample, connectErr: errors.New("page timeout")}
+		ctrl := &mockBluezController{listErr: errors.New("dbus unavailable")}
 		deps := cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }}
 
 		var stdout, stderr bytes.Buffer
-		if code := runWithDeps([]string{"connect"}, strings.NewReader(""), &stdout, &stderr, deps); code != 2 {
-			t.Fatalf("missing arg exit=%d, want 2", code)
+		if code := runWithDeps([]string{"devices", "extra"}, strings.NewReader(""), &stdout, &stderr, deps); code != 2 {
+			t.Fatalf("extra arg exit=%d, want 2", code)
 		}
 		stderr.Reset()
-		if code := runWithDeps([]string{"connect", "Keychron K2"}, strings.NewReader(""), &stdout, &stderr, deps); code != 1 {
-			t.Fatalf("connect error exit=%d, want 1", code)
+		if code := runWithDeps([]string{"devices"}, strings.NewReader(""), &stdout, &stderr, deps); code != 1 {
+			t.Fatalf("list error exit=%d, want 1", code)
 		}
 	})
 }
@@ -616,7 +792,7 @@ func (m *mockAdvertiser) Shutdown() {
 	m.shutdownCalls.Add(1)
 }
 
-func TestCLIDiscover(t *testing.T) {
+func TestCLIPeersScan(t *testing.T) {
 	dir := t.TempDir()
 	storePath := filepath.Join(dir, "peers.json")
 	store := peers.NewStore(storePath)
@@ -659,9 +835,9 @@ func TestCLIDiscover(t *testing.T) {
 		}
 
 		var stdout, stderr bytes.Buffer
-		code := runWithDeps([]string{"discover", "--store", storePath, "--timeout", "1s"}, strings.NewReader(""), &stdout, &stderr, deps)
+		code := runWithDeps([]string{"peers", "scan", "--store", storePath, "--timeout", "1s"}, strings.NewReader(""), &stdout, &stderr, deps)
 		if code != 0 {
-			t.Fatalf("discover exit=%d stderr=%q", code, stderr.String())
+			t.Fatalf("peers scan exit=%d stderr=%q", code, stderr.String())
 		}
 		if gotOpts.ExcludeDeviceID != selfID.DeviceID || gotOpts.PairingOnly {
 			t.Fatalf("unexpected discover opts: %+v", gotOpts)
@@ -672,12 +848,12 @@ func TestCLIDiscover(t *testing.T) {
 			"Pixel 9", "192.168.10.22:41234", "pairing", "unpaired", "phone-2",
 		} {
 			if !strings.Contains(out, want) {
-				t.Fatalf("expected %q in discover output:\n%s", want, out)
+				t.Fatalf("expected %q in peers scan output:\n%s", want, out)
 			}
 		}
 	})
 
-	t.Run("pairing filter and empty results", func(t *testing.T) {
+	t.Run("pairing filter, short flags, inherited store flag, and empty results", func(t *testing.T) {
 		var gotOpts mdns.DiscoverOptions
 		deps := cliDeps{
 			discoverPeers: func(_ context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
@@ -687,30 +863,44 @@ func TestCLIDiscover(t *testing.T) {
 		}
 
 		var stdout, stderr bytes.Buffer
-		code := runWithDeps([]string{"discover", "--pairing", "--store", storePath}, strings.NewReader(""), &stdout, &stderr, deps)
+		code := runWithDeps([]string{"peers", "scan", "-p", "-s", storePath, "-t", "500ms"}, strings.NewReader(""), &stdout, &stderr, deps)
 		if code != 0 {
-			t.Fatalf("discover --pairing exit=%d stderr=%q", code, stderr.String())
+			t.Fatalf("peers scan -p exit=%d stderr=%q", code, stderr.String())
 		}
-		if !gotOpts.PairingOnly {
-			t.Fatalf("expected PairingOnly=true")
+		if !gotOpts.PairingOnly || gotOpts.ExcludeDeviceID != selfID.DeviceID {
+			t.Fatalf("unexpected opts for short flags: %+v", gotOpts)
 		}
 		if !strings.Contains(stdout.String(), "No BlueHop hosts advertising pairing found.") {
 			t.Fatalf("unexpected stdout=%q", stdout.String())
 		}
 
 		stdout.Reset()
-		code = runWithDeps([]string{"discover", "--store", storePath}, strings.NewReader(""), &stdout, &stderr, deps)
+		code = runWithDeps([]string{"peers", "-s", storePath, "scan"}, strings.NewReader(""), &stdout, &stderr, deps)
 		if code != 0 {
-			t.Fatalf("discover empty exit=%d stderr=%q", code, stderr.String())
+			t.Fatalf("peers -s ... scan exit=%d stderr=%q", code, stderr.String())
+		}
+		if gotOpts.ExcludeDeviceID != selfID.DeviceID || gotOpts.PairingOnly {
+			t.Fatalf("unexpected opts when inheriting -s from peers: %+v", gotOpts)
 		}
 		if !strings.Contains(stdout.String(), "No BlueHop hosts found.") {
 			t.Fatalf("unexpected stdout=%q", stdout.String())
 		}
 	})
 
+	t.Run("peers remove supports interspersed short store flag", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps([]string{"peers", "remove", "phone-1", "-s", storePath}, strings.NewReader(""), &stdout, &stderr, cliDeps{})
+		if code != 0 {
+			t.Fatalf("peers remove exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Removed peer phone-1") {
+			t.Fatalf("unexpected stdout=%q", stdout.String())
+		}
+	})
+
 	t.Run("extra argument returns usage error", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		if code := runWithDeps([]string{"discover", "unexpected"}, strings.NewReader(""), &stdout, &stderr, cliDeps{}); code != 2 {
+		if code := runWithDeps([]string{"peers", "scan", "unexpected"}, strings.NewReader(""), &stdout, &stderr, cliDeps{}); code != 2 {
 			t.Fatalf("expected exit 2, got %d", code)
 		}
 	})
@@ -990,7 +1180,7 @@ func TestCLIServeAndPairListenAdvertiseMDNS(t *testing.T) {
 		codeCh := make(chan int, 1)
 		go func() {
 			codeCh <- runWithDeps(
-				[]string{"pair", "--listen", "--addr", "0.0.0.0:0", "--name", "Linux Pairer", "--store", storePath, "--timeout", "200ms"},
+				[]string{"pair", "-l", "-a", "0.0.0.0:0", "-n", "Linux Pairer", "-s", storePath, "-t", "200ms"},
 				strings.NewReader(""),
 				&stdout,
 				&stderr,
@@ -1135,7 +1325,7 @@ func TestCLIGrab(t *testing.T) {
 
 		var stdout, stderr bytes.Buffer
 		code := runWithDeps(
-			[]string{"grab", "--store", storePath, "AC:80:0A:CD:82:A1"},
+			[]string{"grab", "AC:80:0A:CD:82:A1", "-s", storePath},
 			strings.NewReader(""),
 			&stdout,
 			&stderr,

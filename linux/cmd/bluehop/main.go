@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
 	"github.com/hddq/bluehop/linux/internal/grab"
@@ -27,6 +27,7 @@ import (
 	"github.com/hddq/bluehop/linux/internal/pairing"
 	"github.com/hddq/bluehop/linux/internal/peers"
 	"github.com/hddq/bluehop/linux/internal/protocol"
+	"github.com/spf13/pflag"
 )
 
 // version can be overridden at link time via:
@@ -68,32 +69,125 @@ func runWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return runWithDeps(args, stdin, stdout, stderr, defaultDeps())
 }
 
+func parseFlags(fs *pflag.FlagSet, args []string, stderr io.Writer) (int, bool) {
+	return parseFlagsMode(fs, args, true, stderr)
+}
+
+func parseFlagsNoInterspersed(fs *pflag.FlagSet, args []string, stderr io.Writer) (int, bool) {
+	fs.SetInterspersed(false)
+	return parseFlagsMode(fs, args, false, stderr)
+}
+
+func parseFlagsMode(fs *pflag.FlagSet, args []string, interspersed bool, stderr io.Writer) (int, bool) {
+	if err := validateSingleDashLongFlags(fs, args, interspersed); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n\n", err)
+		fs.Usage()
+		return 2, false
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return 0, false
+		}
+		fmt.Fprintf(stderr, "error: %v\n\n", err)
+		fs.Usage()
+		return 2, false
+	}
+	return 0, true
+}
+
+// validateSingleDashLongFlags rejects single-dash spellings of registered multi-character
+// long flags (e.g. -name, -store, -listen) before pflag can interpret them as attached-value
+// short options (e.g. -n ame), while preserving valid short options, option values,
+// interspersed flags, and the -- terminator.
+func validateSingleDashLongFlags(fs *pflag.FlagSet, args []string, interspersed bool) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return nil
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			if !interspersed {
+				return nil
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--") {
+			name := arg[2:]
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				continue
+			}
+			if name == "help" && fs.Lookup("help") == nil {
+				return nil
+			}
+			if f := fs.Lookup(name); f != nil && f.NoOptDefVal == "" {
+				i++
+			}
+			continue
+		}
+
+		body := arg[1:]
+		candidate := body
+		if eq := strings.IndexByte(body, '='); eq >= 0 {
+			candidate = body[:eq]
+		}
+		if len(candidate) > 1 {
+			if f := fs.Lookup(candidate); f != nil {
+				if f.Shorthand != "" {
+					return fmt.Errorf("flag %q requires two dashes; use --%s or -%s", "-"+candidate, f.Name, f.Shorthand)
+				}
+				return fmt.Errorf("flag %q requires two dashes; use --%s", "-"+candidate, f.Name)
+			}
+		}
+
+		// Walk short option clusters so option values (e.g. -n -name) are skipped cleanly.
+		for j := 0; j < len(body); j++ {
+			if body[j] >= utf8.RuneSelf {
+				break
+			}
+			ch := body[j : j+1]
+			f := fs.ShorthandLookup(ch)
+			if f == nil {
+				if ch == "h" {
+					return nil
+				}
+				break
+			}
+			if f.NoOptDefVal != "" {
+				if j+1 < len(body) && body[j+1] == '=' {
+					break
+				}
+				continue
+			}
+			if j+1 < len(body) {
+				// Attached value (e.g. -nMyHost or -n=MyHost); does not consume args[i+1].
+				break
+			}
+			i++
+			break
+		}
+	}
+	return nil
+}
+
 func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliDeps) int {
-	fs := flag.NewFlagSet("bluehop", flag.ContinueOnError)
+	fs := pflag.NewFlagSet("bluehop", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: bluehop <command> [options]")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Commands:")
-		fmt.Fprintln(stderr, "  grab        Release a Bluetooth device from another host and connect here")
-		fmt.Fprintln(stderr, "  devices     List paired Bluetooth devices via BlueZ")
-		fmt.Fprintln(stderr, "  connect     Connect to a paired Bluetooth device")
-		fmt.Fprintln(stderr, "  disconnect  Disconnect a paired Bluetooth device")
-		fmt.Fprintln(stderr, "  discover    Discover BlueHop hosts on the local network (mDNS)")
-		fmt.Fprintln(stderr, "  serve       Run the holder HTTP server (/status, /release)")
-		fmt.Fprintln(stderr, "  pair        Pair with another BlueHop host via ECDH + 6-digit SAS")
-		fmt.Fprintln(stderr, "  peers       List or remove paired hosts")
-		fmt.Fprintln(stderr, "  version     Print the bluehop CLI version")
+		fmt.Fprintln(stderr, "  grab <device>   Switch a Bluetooth device to this PC (releasing it from another host if needed)")
+		fmt.Fprintln(stderr, "  devices         List paired Bluetooth devices")
+		fmt.Fprintln(stderr, "  serve           Run in the background so other hosts can take Bluetooth devices from this PC")
+		fmt.Fprintln(stderr, "  pair            Pair with another BlueHop host (phone or PC)")
+		fmt.Fprintln(stderr, "  peers           Manage paired BlueHop hosts (list, scan, remove)")
+		fmt.Fprintln(stderr, "  version         Print the bluehop CLI version")
 		fmt.Fprintln(stderr, "")
-		fmt.Fprintln(stderr, "Options:")
-		fs.PrintDefaults()
+		fmt.Fprintln(stderr, "Run 'bluehop <command> --help' for more information on a command.")
 	}
 
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlagsNoInterspersed(fs, args, stderr); !ok {
+		return code
 	}
 
 	if fs.NArg() == 0 {
@@ -117,18 +211,12 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		return runGrab(fs.Args()[1:], stdout, stderr, deps)
 	case "devices":
 		return runDevices(fs.Args()[1:], stdout, stderr, deps)
-	case "connect":
-		return runBluetoothAction("connect", fs.Args()[1:], stdout, stderr, deps)
-	case "disconnect":
-		return runBluetoothAction("disconnect", fs.Args()[1:], stdout, stderr, deps)
-	case "discover":
-		return runDiscover(fs.Args()[1:], stdout, stderr, deps)
 	case "serve":
 		return runServe(fs.Args()[1:], stdout, stderr, deps)
 	case "pair":
 		return runPair(fs.Args()[1:], stdin, stdout, stderr, deps)
 	case "peers":
-		return runPeers(fs.Args()[1:], stdout, stderr)
+		return runPeers(fs.Args()[1:], stdout, stderr, deps)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n\n", fs.Arg(0))
 		fs.Usage()
@@ -137,26 +225,23 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 }
 
 func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliDeps) int {
-	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
+	fs := pflag.NewFlagSet("pair", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	listenMode := fs.Bool("listen", false, "Wait for an incoming pairing request and display the 6-digit SAS")
-	listenAddr := fs.String("addr", ":0", "Listen address when --listen is set (default :0)")
-	nameFlag := fs.String("name", "", "Local device name advertised during pairing")
-	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
-	timeoutFlag := fs.Duration("timeout", (protocol.PairingSessionTTLSec+15)*time.Second, "Pairing timeout")
+	listenMode := fs.BoolP("listen", "l", false, "Wait for an incoming pairing request and display the 6-digit verification code")
+	listenAddr := fs.StringP("addr", "a", ":0", "Listen address when --listen is set")
+	nameFlag := fs.StringP("name", "n", "", "Local device name advertised during pairing")
+	storeFlag := fs.StringP("store", "s", "", "Path to peers.json (default XDG config)")
+	timeoutFlag := fs.DurationP("timeout", "t", (protocol.PairingSessionTTLSec+15)*time.Second, "Pairing timeout")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
 		fmt.Fprintln(stderr, "  bluehop pair [options] [<host:port>]  Discover or connect to a waiting host")
-		fmt.Fprintln(stderr, "  bluehop pair --listen [options]       Wait for a peer, verify SAS, and Accept/Reject")
+		fmt.Fprintln(stderr, "  bluehop pair --listen [options]       Wait for a peer, verify 6-digit code, and Accept/Reject")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlags(fs, args, stderr); !ok {
+		return code
 	}
 
 	storePath, err := resolveStorePath(*storeFlag)
@@ -478,42 +563,57 @@ func runPairServer(
 	}
 }
 
-func runPeers(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("peers", flag.ContinueOnError)
+func runPeers(args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	fs := pflag.NewFlagSet("peers", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
+	storeFlag := fs.StringP("store", "s", "", "Path to peers.json (default XDG config)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  bluehop peers [options] [list]")
-		fmt.Fprintln(stderr, "  bluehop peers [options] remove <peerId>")
+		fmt.Fprintln(stderr, "  bluehop peers [options] [list]            List paired hosts")
+		fmt.Fprintln(stderr, "  bluehop peers scan [options]              Scan the local network for online BlueHop hosts")
+		fmt.Fprintln(stderr, "  bluehop peers remove [options] <peerId>   Remove a paired host")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
+		fmt.Fprintln(stderr, "")
+		fmt.Fprintln(stderr, "Run 'bluehop peers <subcommand> --help' for subcommand options.")
 	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlagsNoInterspersed(fs, args, stderr); !ok {
+		return code
 	}
-
-	storePath, err := resolveStorePath(*storeFlag)
-	if err != nil {
-		fmt.Fprintf(stderr, "resolve peer store path: %v\n", err)
-		return 1
-	}
-	store := peers.NewStore(storePath)
 
 	sub := "list"
+	var subArgs []string
 	if fs.NArg() > 0 {
 		sub = fs.Arg(0)
+		subArgs = fs.Args()[1:]
 	}
+
 	switch sub {
 	case "list":
-		if fs.NArg() > 1 {
-			fs.Usage()
+		subFS := pflag.NewFlagSet("peers list", pflag.ContinueOnError)
+		subFS.SetOutput(stderr)
+		subStore := subFS.StringP("store", "s", *storeFlag, "Path to peers.json (default XDG config)")
+		subFS.Usage = func() {
+			fmt.Fprintln(stderr, "Usage:")
+			fmt.Fprintln(stderr, "  bluehop peers list [options]")
+			fmt.Fprintln(stderr, "")
+			fmt.Fprintln(stderr, "Options:")
+			subFS.PrintDefaults()
+		}
+		if code, ok := parseFlags(subFS, subArgs, stderr); !ok {
+			return code
+		}
+		if subFS.NArg() > 0 {
+			subFS.Usage()
 			return 2
 		}
+		storePath, err := resolveStorePath(*subStore)
+		if err != nil {
+			fmt.Fprintf(stderr, "resolve peer store path: %v\n", err)
+			return 1
+		}
+		store := peers.NewStore(storePath)
 		list, err := store.ListPeers()
 		if err != nil {
 			fmt.Fprintf(stderr, "list peers: %v\n", err)
@@ -527,22 +627,47 @@ func runPeers(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "%s\t%s\n", p.PeerID, p.PeerName)
 		}
 		return 0
+
+	case "scan":
+		return runPeersScan(subArgs, *storeFlag, stdout, stderr, deps)
+
 	case "remove":
-		if fs.NArg() != 2 {
-			fs.Usage()
+		subFS := pflag.NewFlagSet("peers remove", pflag.ContinueOnError)
+		subFS.SetOutput(stderr)
+		subStore := subFS.StringP("store", "s", *storeFlag, "Path to peers.json (default XDG config)")
+		subFS.Usage = func() {
+			fmt.Fprintln(stderr, "Usage:")
+			fmt.Fprintln(stderr, "  bluehop peers remove [options] <peerId>")
+			fmt.Fprintln(stderr, "")
+			fmt.Fprintln(stderr, "Options:")
+			subFS.PrintDefaults()
+		}
+		if code, ok := parseFlags(subFS, subArgs, stderr); !ok {
+			return code
+		}
+		if subFS.NArg() != 1 {
+			subFS.Usage()
 			return 2
 		}
-		removed, err := store.RemovePeer(fs.Arg(1))
+		storePath, err := resolveStorePath(*subStore)
+		if err != nil {
+			fmt.Fprintf(stderr, "resolve peer store path: %v\n", err)
+			return 1
+		}
+		store := peers.NewStore(storePath)
+		peerID := subFS.Arg(0)
+		removed, err := store.RemovePeer(peerID)
 		if err != nil {
 			fmt.Fprintf(stderr, "remove peer: %v\n", err)
 			return 1
 		}
 		if !removed {
-			fmt.Fprintf(stderr, "peer not found: %s\n", fs.Arg(1))
+			fmt.Fprintf(stderr, "peer not found: %s\n", peerID)
 			return 1
 		}
-		fmt.Fprintf(stdout, "Removed peer %s\n", fs.Arg(1))
+		fmt.Fprintf(stdout, "Removed peer %s\n", peerID)
 		return 0
+
 	default:
 		fs.Usage()
 		return 2
@@ -550,9 +675,9 @@ func runPeers(args []string, stdout, stderr io.Writer) int {
 }
 
 func runDevices(args []string, stdout, stderr io.Writer, deps cliDeps) int {
-	fs := flag.NewFlagSet("devices", flag.ContinueOnError)
+	fs := pflag.NewFlagSet("devices", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	timeoutFlag := fs.Duration("timeout", 5*time.Second, "BlueZ D-Bus timeout")
+	timeoutFlag := fs.DurationP("timeout", "t", 5*time.Second, "Bluetooth query timeout")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
 		fmt.Fprintln(stderr, "  bluehop devices [options]")
@@ -560,11 +685,8 @@ func runDevices(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlags(fs, args, stderr); !ok {
+		return code
 	}
 	if fs.NArg() > 0 {
 		fs.Usage()
@@ -605,76 +727,6 @@ func runDevices(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 	return 0
 }
 
-func runBluetoothAction(action string, args []string, stdout, stderr io.Writer, deps cliDeps) int {
-	defaultTimeout := 30 * time.Second
-	if action == "disconnect" {
-		defaultTimeout = 15 * time.Second
-	}
-
-	fs := flag.NewFlagSet(action, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	timeoutFlag := fs.Duration("timeout", defaultTimeout, "BlueZ D-Bus operation timeout")
-	fs.Usage = func() {
-		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintf(stderr, "  bluehop %s [options] <mac-or-name>\n", action)
-		fmt.Fprintln(stderr, "")
-		fmt.Fprintln(stderr, "Options:")
-		fs.PrintDefaults()
-	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 1 {
-		fs.Usage()
-		return 2
-	}
-
-	ctrl, err := deps.openBluez()
-	if err != nil {
-		fmt.Fprintf(stderr, "open BlueZ controller: %v\n", err)
-		return 1
-	}
-	defer ctrl.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if *timeoutFlag > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, *timeoutFlag)
-		defer cancel()
-	}
-
-	target := fs.Arg(0)
-	if action == "connect" {
-		dev, err := ctrl.Connect(ctx, target)
-		if errors.Is(err, bluez.ErrAlreadyConnected) {
-			fmt.Fprintf(stdout, "%s (%s) is already connected\n", dev.DisplayName(), dev.Address)
-			return 0
-		}
-		if err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "Connected to %s (%s)\n", dev.DisplayName(), dev.Address)
-		return 0
-	}
-
-	dev, err := ctrl.Disconnect(ctx, target)
-	if errors.Is(err, bluez.ErrNotConnected) {
-		fmt.Fprintf(stdout, "%s (%s) is already disconnected\n", dev.DisplayName(), dev.Address)
-		return 0
-	}
-	if err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "Disconnected from %s (%s)\n", dev.DisplayName(), dev.Address)
-	return 0
-}
-
 type discovererFunc func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error)
 
 func (f discovererFunc) Discover(ctx context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
@@ -682,12 +734,12 @@ func (f discovererFunc) Discover(ctx context.Context, opts mdns.DiscoverOptions)
 }
 
 func runGrab(args []string, stdout, stderr io.Writer, deps cliDeps) int {
-	fs := flag.NewFlagSet("grab", flag.ContinueOnError)
+	fs := pflag.NewFlagSet("grab", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	discoverTimeout := fs.Duration("discover-timeout", grab.DefaultDiscoveryTimeout, "mDNS discovery timeout")
-	timeoutFlag := fs.Duration("timeout", 45*time.Second, "Overall grab operation timeout")
-	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
-	nameFlag := fs.String("name", "", "Local device name override")
+	discoverTimeout := fs.DurationP("discover-timeout", "d", grab.DefaultDiscoveryTimeout, "LAN discovery timeout")
+	timeoutFlag := fs.DurationP("timeout", "t", 45*time.Second, "Overall grab operation timeout")
+	storeFlag := fs.StringP("store", "s", "", "Path to peers.json (default XDG config)")
+	nameFlag := fs.StringP("name", "n", "", "Local device name override")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
 		fmt.Fprintln(stderr, "  bluehop grab [options] <mac-or-name>")
@@ -695,11 +747,8 @@ func runGrab(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlags(fs, args, stderr); !ok {
+		return code
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
@@ -788,11 +837,11 @@ func runGrab(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 }
 
 func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs := pflag.NewFlagSet("serve", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	addrFlag := fs.String("addr", holder.DefaultAddr, "Listen address")
-	nameFlag := fs.String("name", "", "Local device name reported in /status")
-	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
+	addrFlag := fs.StringP("addr", "a", holder.DefaultAddr, "Listen address")
+	nameFlag := fs.StringP("name", "n", "", "Local device name reported to peers")
+	storeFlag := fs.StringP("store", "s", "", "Path to peers.json (default XDG config)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
 		fmt.Fprintln(stderr, "  bluehop serve [options]")
@@ -800,11 +849,8 @@ func runServe(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlags(fs, args, stderr); !ok {
+		return code
 	}
 	if fs.NArg() > 0 {
 		fs.Usage()
@@ -1050,24 +1096,21 @@ func watchAndRefreshMDNS(
 	}
 }
 
-func runDiscover(args []string, stdout, stderr io.Writer, deps cliDeps) int {
-	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
+func runPeersScan(args []string, defaultStore string, stdout, stderr io.Writer, deps cliDeps) int {
+	fs := pflag.NewFlagSet("peers scan", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	timeoutFlag := fs.Duration("timeout", 3*time.Second, "mDNS discovery duration")
-	pairingFlag := fs.Bool("pairing", false, "Only show hosts advertising pairing (pair=1)")
-	storeFlag := fs.String("store", "", "Path to peers.json (default XDG config)")
+	timeoutFlag := fs.DurationP("timeout", "t", 3*time.Second, "LAN discovery duration")
+	pairingFlag := fs.BoolP("pairing", "p", false, "Only show hosts advertising pairing")
+	storeFlag := fs.StringP("store", "s", defaultStore, "Path to peers.json (default XDG config)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  bluehop discover [options]")
+		fmt.Fprintln(stderr, "  bluehop peers scan [options]")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
+	if code, ok := parseFlags(fs, args, stderr); !ok {
+		return code
 	}
 	if fs.NArg() > 0 {
 		fs.Usage()
