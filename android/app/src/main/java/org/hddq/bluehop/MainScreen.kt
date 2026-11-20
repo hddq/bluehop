@@ -40,7 +40,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -440,7 +439,6 @@ sealed interface HopUiStatus {
     data class Finished(val outcome: HopOutcome) : HopUiStatus
 }
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun MainScreen(
     permissions: List<ManagedPermission>,
@@ -735,7 +733,6 @@ private fun SectionHeader(
     )
 }
 
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun PermissionListItem(
     item: ManagedPermission,
@@ -1021,7 +1018,6 @@ private fun BondedDeviceListItem(
     )
 }
 
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun DeviceStateListItem(
     iconRes: Int,
@@ -1078,7 +1074,6 @@ private fun DeviceStateListItem(
     )
 }
 
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun PairedHostListItem(
     peer: PairedPeerSummary,
@@ -1139,7 +1134,6 @@ private fun PairedHostListItem(
     )
 }
 
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun VersionListItem(
     versionName: String,

@@ -96,7 +96,6 @@ enum class PairingMode {
     CONNECT,
 }
 
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun PairingDialog(
     pairedPeersRepository: PairedPeersRepository,
