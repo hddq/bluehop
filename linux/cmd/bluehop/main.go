@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hddq/bluehop/linux/internal/bluez"
 	"github.com/hddq/bluehop/linux/internal/grab"
@@ -69,6 +70,20 @@ func runWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func parseFlags(fs *pflag.FlagSet, args []string, stderr io.Writer) (int, bool) {
+	return parseFlagsMode(fs, args, true, stderr)
+}
+
+func parseFlagsNoInterspersed(fs *pflag.FlagSet, args []string, stderr io.Writer) (int, bool) {
+	fs.SetInterspersed(false)
+	return parseFlagsMode(fs, args, false, stderr)
+}
+
+func parseFlagsMode(fs *pflag.FlagSet, args []string, interspersed bool, stderr io.Writer) (int, bool) {
+	if err := validateSingleDashLongFlags(fs, args, interspersed); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n\n", err)
+		fs.Usage()
+		return 2, false
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
 			return 0, false
@@ -80,10 +95,83 @@ func parseFlags(fs *pflag.FlagSet, args []string, stderr io.Writer) (int, bool) 
 	return 0, true
 }
 
+// validateSingleDashLongFlags rejects single-dash spellings of registered multi-character
+// long flags (e.g. -name, -store, -listen) before pflag can interpret them as attached-value
+// short options (e.g. -n ame), while preserving valid short options, option values,
+// interspersed flags, and the -- terminator.
+func validateSingleDashLongFlags(fs *pflag.FlagSet, args []string, interspersed bool) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return nil
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			if !interspersed {
+				return nil
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--") {
+			name := arg[2:]
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				continue
+			}
+			if name == "help" && fs.Lookup("help") == nil {
+				return nil
+			}
+			if f := fs.Lookup(name); f != nil && f.NoOptDefVal == "" {
+				i++
+			}
+			continue
+		}
+
+		body := arg[1:]
+		candidate := body
+		if eq := strings.IndexByte(body, '='); eq >= 0 {
+			candidate = body[:eq]
+		}
+		if len(candidate) > 1 {
+			if f := fs.Lookup(candidate); f != nil {
+				if f.Shorthand != "" {
+					return fmt.Errorf("flag %q requires two dashes; use --%s or -%s", "-"+candidate, f.Name, f.Shorthand)
+				}
+				return fmt.Errorf("flag %q requires two dashes; use --%s", "-"+candidate, f.Name)
+			}
+		}
+
+		// Walk short option clusters so option values (e.g. -n -name) are skipped cleanly.
+		for j := 0; j < len(body); j++ {
+			if body[j] >= utf8.RuneSelf {
+				break
+			}
+			ch := body[j : j+1]
+			f := fs.ShorthandLookup(ch)
+			if f == nil {
+				if ch == "h" {
+					return nil
+				}
+				break
+			}
+			if f.NoOptDefVal != "" {
+				if j+1 < len(body) && body[j+1] == '=' {
+					break
+				}
+				continue
+			}
+			if j+1 < len(body) {
+				// Attached value (e.g. -nMyHost or -n=MyHost); does not consume args[i+1].
+				break
+			}
+			i++
+			break
+		}
+	}
+	return nil
+}
+
 func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliDeps) int {
 	fs := pflag.NewFlagSet("bluehop", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.SetInterspersed(false)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: bluehop <command> [options]")
 		fmt.Fprintln(stderr, "")
@@ -98,7 +186,7 @@ func runWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps 
 		fmt.Fprintln(stderr, "Run 'bluehop <command> --help' for more information on a command.")
 	}
 
-	if code, ok := parseFlags(fs, args, stderr); !ok {
+	if code, ok := parseFlagsNoInterspersed(fs, args, stderr); !ok {
 		return code
 	}
 
@@ -478,7 +566,6 @@ func runPairServer(
 func runPeers(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 	fs := pflag.NewFlagSet("peers", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.SetInterspersed(false)
 	storeFlag := fs.StringP("store", "s", "", "Path to peers.json (default XDG config)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
@@ -491,7 +578,7 @@ func runPeers(args []string, stdout, stderr io.Writer, deps cliDeps) int {
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Run 'bluehop peers <subcommand> --help' for subcommand options.")
 	}
-	if code, ok := parseFlags(fs, args, stderr); !ok {
+	if code, ok := parseFlagsNoInterspersed(fs, args, stderr); !ok {
 		return code
 	}
 

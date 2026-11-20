@@ -91,6 +91,192 @@ func TestRunHelpAndVersion(t *testing.T) {
 	}
 }
 
+func TestCLISingleDashLongFlagRejection(t *testing.T) {
+	t.Run("rejects registered single-dash long flags before reaching command execution", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			args     []string
+			wantHint string
+		}{
+			{
+				name:     "grab -name before positional",
+				args:     []string{"grab", "-name", "Keyboard"},
+				wantHint: "--name",
+			},
+			{
+				name:     "grab -name=value",
+				args:     []string{"grab", "-name=MyPC", "Keyboard"},
+				wantHint: "--name",
+			},
+			{
+				name:     "grab interspersed -store after positional",
+				args:     []string{"grab", "Keyboard", "-store", "/tmp/peers.json"},
+				wantHint: "--store",
+			},
+			{
+				name:     "grab -discover-timeout",
+				args:     []string{"grab", "-discover-timeout", "5s", "Keyboard"},
+				wantHint: "--discover-timeout",
+			},
+			{
+				name:     "pair -listen",
+				args:     []string{"pair", "-listen"},
+				wantHint: "--listen",
+			},
+			{
+				name:     "pair -addr",
+				args:     []string{"pair", "-addr", ":8765"},
+				wantHint: "--addr",
+			},
+			{
+				name:     "serve -store",
+				args:     []string{"serve", "-store", "/tmp/peers.json"},
+				wantHint: "--store",
+			},
+			{
+				name:     "devices -timeout",
+				args:     []string{"devices", "-timeout", "2s"},
+				wantHint: "--timeout",
+			},
+			{
+				name:     "peers -store before subcommand",
+				args:     []string{"peers", "-store", "/tmp/peers.json", "list"},
+				wantHint: "--store",
+			},
+			{
+				name:     "peers scan -pairing",
+				args:     []string{"peers", "scan", "-pairing"},
+				wantHint: "--pairing",
+			},
+			{
+				name:     "peers scan after valid short flag",
+				args:     []string{"peers", "scan", "-p", "-timeout", "1s"},
+				wantHint: "--timeout",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				bluezOpened := false
+				discoverCalled := false
+				deps := cliDeps{
+					openBluez: func() (bluez.Controller, error) {
+						bluezOpened = true
+						return nil, errors.New("should not open bluez")
+					},
+					discoverPeers: func(context.Context, mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+						discoverCalled = true
+						return nil, errors.New("should not discover peers")
+					},
+				}
+
+				var stdout, stderr bytes.Buffer
+				code := runWithDeps(tc.args, strings.NewReader(""), &stdout, &stderr, deps)
+				if code != 2 {
+					t.Fatalf("args=%v exit=%d, want 2 (stderr=%q)", tc.args, code, stderr.String())
+				}
+				if bluezOpened {
+					t.Fatalf("args=%v unexpectedly opened BlueZ controller", tc.args)
+				}
+				if discoverCalled {
+					t.Fatalf("args=%v unexpectedly invoked discovery", tc.args)
+				}
+				if !strings.Contains(stderr.String(), tc.wantHint) || !strings.Contains(stderr.String(), "Usage:") {
+					t.Fatalf("args=%v expected hint %q and usage in stderr, got %q", tc.args, tc.wantHint, stderr.String())
+				}
+			})
+		}
+	})
+
+	t.Run("preserves valid short options, option values, interspersed flags, and -- terminator", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+
+		newCtrl := func(alias string) *mockBluezController {
+			return &mockBluezController{
+				devices: []bluez.Device{
+					{Address: "AA:BB:CC:DD:EE:01", Alias: alias, Connected: true},
+				},
+			}
+		}
+
+		// Attached short option value (-nMyHost) and interspersed -s after positional arg.
+		var stdout, stderr bytes.Buffer
+		ctrl := newCtrl("Keyboard")
+		code := runWithDeps(
+			[]string{"grab", "-nMyHost", "Keyboard", "-s", storePath},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+		)
+		if code != 0 {
+			t.Fatalf("attached short flag failed: exit=%d stderr=%q", code, stderr.String())
+		}
+
+		// Option values matching registered single-dash long flag spellings (-n -name, --name -store).
+		for _, args := range [][]string{
+			{"grab", "-n", "-name", "-s", storePath, "Keyboard"},
+			{"grab", "--name", "-store", "-s", storePath, "Keyboard"},
+		} {
+			stdout.Reset()
+			stderr.Reset()
+			ctrl = newCtrl("Keyboard")
+			code = runWithDeps(
+				args,
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+			)
+			if code != 0 {
+				t.Fatalf("option value args=%v failed: exit=%d stderr=%q", args, code, stderr.String())
+			}
+		}
+
+		// -- terminator allows a positional argument literally named "-name".
+		stdout.Reset()
+		stderr.Reset()
+		ctrl = newCtrl("-name")
+		code = runWithDeps(
+			[]string{"grab", "-s", storePath, "--", "-name"},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{openBluez: func() (bluez.Controller, error) { return ctrl, nil }},
+		)
+		if code != 0 {
+			t.Fatalf("-- terminator failed: exit=%d stderr=%q", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "-name (AA:BB:CC:DD:EE:01) is already connected") {
+			t.Fatalf("unexpected stdout for -- -name: %q", stdout.String())
+		}
+
+		// Combined short options (-ps <store>) on peers scan.
+		stdout.Reset()
+		stderr.Reset()
+		var gotOpts mdns.DiscoverOptions
+		code = runWithDeps(
+			[]string{"peers", "scan", "-ps", storePath},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{
+				discoverPeers: func(_ context.Context, opts mdns.DiscoverOptions) ([]mdns.DiscoveredPeer, error) {
+					gotOpts = opts
+					return nil, nil
+				},
+			},
+		)
+		if code != 0 {
+			t.Fatalf("peers scan -ps failed: exit=%d stderr=%q", code, stderr.String())
+		}
+		if !gotOpts.PairingOnly {
+			t.Fatalf("expected PairingOnly=true for -ps")
+		}
+	})
+}
+
 func TestFormatBuildVersion(t *testing.T) {
 	tests := []struct {
 		name string
