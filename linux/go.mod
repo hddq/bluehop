@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/grandcat/zeroconf v1.0.0
+	github.com/spf13/pflag v1.1.0
 )
 
 require (
