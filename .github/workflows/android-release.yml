@@ -15,8 +15,6 @@ concurrency:
 jobs:
   validate-version:
     runs-on: ubuntu-latest
-    outputs:
-      version_code: ${{ steps.version.outputs.version_code }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -47,12 +45,34 @@ jobs:
             exit 1
           fi
 
-          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
+          CHANGELOG_FILE="CHANGELOG.md"
+          VERSION="${TAG#v}"
           if [ ! -f "$CHANGELOG_FILE" ]; then
             echo "::warning::$CHANGELOG_FILE not found; releasing without a Highlights section."
+          else
+            HAS_ENTRY=$(awk -v ver="$VERSION" '
+              { sub(/\r$/, "") }
+              /^##[[:space:]]+/ {
+                if (in_section) exit
+                heading = $0
+                sub(/^##[[:space:]]+/, "", heading)
+                sub(/[[:space:]].*$/, "", heading)
+                sub(/\]\(.*\)$/, "]", heading)
+                gsub(/^\[|\]$/, "", heading)
+                sub(/^v/, "", heading)
+                if (heading == ver) {
+                  in_section = 1
+                  next
+                }
+              }
+              in_section && /^\[[^]]+\]:[[:space:]]+/ { exit }
+              in_section && $0 !~ /^[[:space:]]*$/ { found = 1; exit }
+              END { if (found) print "yes" }
+            ' "$CHANGELOG_FILE")
+            if [ -z "$HAS_ENTRY" ]; then
+              echo "::warning::No non-empty entry for $VERSION in $CHANGELOG_FILE; releasing without a Highlights section."
+            fi
           fi
-
-          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
 
   build-and-release:
     needs: validate-version
@@ -173,11 +193,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          VERSION_CODE: ${{ needs.validate-version.outputs.version_code }}
         run: |
           set -euo pipefail
           RELEASE_BODY_FILE="$RUNNER_TEMP/release-body.md"
-          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
+          CHANGELOG_FILE="CHANGELOG.md"
+          VERSION="${TAG#v}"
 
           BASE_TAG="${TAG%%-*}"
           STABLE_TAGS=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName')
@@ -195,13 +215,42 @@ jobs:
           fi
           GENERATED_NOTES=$(gh api "repos/${{ github.repository }}/releases/generate-notes" "${notes_args[@]}" --jq '.body')
 
+          HIGHLIGHTS=""
+          if [ -f "$CHANGELOG_FILE" ]; then
+            HIGHLIGHTS=$(awk -v ver="$VERSION" '
+              { sub(/\r$/, "") }
+              /^##[[:space:]]+/ {
+                if (in_section) exit
+                heading = $0
+                sub(/^##[[:space:]]+/, "", heading)
+                sub(/[[:space:]].*$/, "", heading)
+                sub(/\]\(.*\)$/, "]", heading)
+                gsub(/^\[|\]$/, "", heading)
+                sub(/^v/, "", heading)
+                if (heading == ver) {
+                  in_section = 1
+                  next
+                }
+              }
+              in_section && /^\[[^]]+\]:[[:space:]]+/ { exit }
+              in_section {
+                if (!started && $0 ~ /^[[:space:]]*$/) next
+                started = 1
+                lines[++n] = $0
+              }
+              END {
+                while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+                for (i = 1; i <= n; i++) print lines[i]
+              }
+            ' "$CHANGELOG_FILE")
+          fi
+
           {
-            if [ -f "$CHANGELOG_FILE" ]; then
-              echo "Using changelog: $CHANGELOG_FILE" >&2
+            if [ -n "$HIGHLIGHTS" ]; then
+              echo "Using changelog section for $VERSION from $CHANGELOG_FILE" >&2
               echo "## Highlights"
               echo ""
-              cat "$CHANGELOG_FILE"
-              printf '\n\n'
+              printf '%s\n\n' "$HIGHLIGHTS"
             fi
             printf '%s\n' "$GENERATED_NOTES"
           } > "$RELEASE_BODY_FILE"
