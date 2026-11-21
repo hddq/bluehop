@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
 ### Linux
 
 - Add Linux client.
@@ -21,5 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial Android release.
 
-[Unreleased]: https://github.com/hddq/bluehop/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/hddq/bluehop/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/hddq/bluehop/releases/tag/v0.2.0
 [0.1.0]: https://github.com/hddq/bluehop/releases/tag/v0.1.0
