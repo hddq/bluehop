@@ -17,7 +17,7 @@ BlueHop automates that handoff over your local Wi-Fi network:
 | Platform | Status |
 | --- | --- |
 | Android | Supported (Android 17 / SDK 37+) |
-| Linux | Pairing CLI (`linux/`), host daemon coming soon |
+| Linux | Supported (BlueZ over D-Bus, `linux/` CLI & host daemon) |
 | Windows / macOS / iOS / others | Pull requests welcome! |
 
 If you'd like to add support for another platform (Windows, macOS, iOS, etc.), feel free to open a pull request — the [wire protocol](protocol/README.md) is simple HTTP/JSON + ECDH/HKDF + HMAC-SHA256 over mDNS.
@@ -25,3 +25,23 @@ If you'd like to add support for another platform (Windows, macOS, iOS, etc.), f
 ### Android
 
 BlueHop requires **Android 17 (SDK 37) or newer**. Android 17 is the first version of Android that lets regular apps connect and disconnect your paired Bluetooth devices on your behalf, which wasn't possible on older versions without root or system-level workarounds.
+
+### Linux
+
+BlueHop provides a standalone `bluehop` CLI and host daemon in [`linux/`](linux/) for Linux systems running **BlueZ** (`org.bluez` on the system D-Bus) with local network mDNS access.
+
+Prebuilt static binaries for `linux/amd64` and `linux/arm64` are attached to [GitHub Releases](https://github.com/hddq/bluehop/releases) alongside the Android APK (verified with `SHA256SUMS.txt`), or you can build from source with Go:
+
+```sh
+cd linux
+go build -o bluehop ./cmd/bluehop
+```
+
+Common commands:
+
+- `bluehop devices` — list paired Bluetooth devices
+- `bluehop pair --listen` / `bluehop pair` — pair with another BlueHop host over Wi-Fi
+- `bluehop serve` — run the holder server so other hosts can request releases
+- `bluehop grab <mac-or-name>` — release a Bluetooth device from the current holder and connect locally
+- `bluehop peers [list|scan|remove]` — manage paired BlueHop hosts
+- `bluehop version` — print the CLI version

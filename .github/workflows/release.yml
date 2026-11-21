@@ -1,4 +1,4 @@
-name: Android Release
+name: Release
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: android-release-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -76,7 +76,7 @@ jobs:
             fi
           fi
 
-  build-and-release:
+  build-android:
     needs: validate-version
     runs-on: ubuntu-latest
     env:
@@ -146,7 +146,6 @@ jobs:
         run: ./gradlew --no-daemon assembleRelease
 
       - name: Collect release APKs
-        id: collect_apks
         run: |
           set -euo pipefail
           mapfile -t apks < <(find android/app/build/outputs/apk -type f -path '*/release/*.apk' | sort)
@@ -167,17 +166,6 @@ jobs:
             cp "$apk" "release-assets/$filename"
           done
 
-          {
-            echo "files<<EOF"
-            find release-assets -type f -name '*.apk' | sort
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Generate SHA256 checksums
-        run: |
-          set -euo pipefail
-          (cd release-assets && sha256sum *.apk > SHA256SUMS.txt)
-
       - name: Collect and compress release mapping
         run: |
           set -euo pipefail
@@ -188,6 +176,128 @@ jobs:
           fi
           echo "Found mapping file: ${mappings[0]}"
           gzip -9 -n -c "${mappings[0]}" > release-assets/mapping.txt.gz
+
+      - name: Upload Android release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-android-assets
+          path: release-assets/
+          if-no-files-found: error
+
+      - name: Remove signing keystore
+        if: always()
+        run: |
+          if [ -n "${ANDROID_SIGNING_KEYSTORE_FILE:-}" ] && [ -f "$ANDROID_SIGNING_KEYSTORE_FILE" ]; then
+            shred -u "$ANDROID_SIGNING_KEYSTORE_FILE" || rm -f "$ANDROID_SIGNING_KEYSTORE_FILE"
+          fi
+
+  build-linux:
+    needs: validate-version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: linux/go.mod
+          cache-dependency-path: linux/go.mod
+
+      - name: Run go vet
+        working-directory: linux
+        run: go vet ./...
+
+      - name: Run tests
+        working-directory: linux
+        run: go test -v -race ./...
+
+      - name: Build Linux release archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for arch in amd64 arm64; do
+            stage_dir="$RUNNER_TEMP/bluehop-${TAG}-linux-${arch}"
+            rm -rf "$stage_dir"
+            mkdir -p "$stage_dir"
+            (
+              cd linux
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+                -trimpath \
+                -ldflags "-s -w -X main.version=${TAG}" \
+                -o "${stage_dir}/bluehop" \
+                ./cmd/bluehop
+            )
+            chmod 0755 "${stage_dir}/bluehop"
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -C "$stage_dir" -cf - bluehop \
+              | gzip -9 -n > "release-assets/bluehop-${TAG}-linux-${arch}.tar.gz"
+          done
+
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-assets
+          path: release-assets/
+          if-no-files-found: error
+
+  publish-release:
+    needs: [validate-version, build-android, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download Android release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-android-assets
+          path: release-assets
+
+      - name: Download Linux release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-linux-assets
+          path: release-assets
+
+      - name: Collect assets and generate SHA256 checksums
+        id: collect_assets
+        run: |
+          set -euo pipefail
+          mapfile -t artifacts < <(find release-assets -maxdepth 1 -type f \( -name '*.apk' -o -name '*.tar.gz' \) | sort)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No release artifacts were found."
+            exit 1
+          fi
+          if ! find release-assets -maxdepth 1 -type f -name '*.apk' | grep -q .; then
+            echo "No Android APK artifacts were found."
+            exit 1
+          fi
+          if ! find release-assets -maxdepth 1 -type f -name '*.tar.gz' | grep -q .; then
+            echo "No Linux archive artifacts were found."
+            exit 1
+          fi
+          test -f release-assets/mapping.txt.gz
+
+          (
+            cd release-assets
+            find . -maxdepth 1 -type f \( -name '*.apk' -o -name '*.tar.gz' \) -printf '%f\n' \
+              | sort \
+              | xargs sha256sum > SHA256SUMS.txt
+          )
+          cat release-assets/SHA256SUMS.txt
+
+          {
+            echo "files<<EOF"
+            printf '%s\n' "${artifacts[@]}"
+            echo "release-assets/SHA256SUMS.txt"
+            echo "release-assets/mapping.txt.gz"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare release notes
         id: changelog
@@ -269,13 +379,4 @@ jobs:
           generate_release_notes: false
           body_path: ${{ steps.changelog.outputs.path }}
           files: |
-            ${{ steps.collect_apks.outputs.files }}
-            release-assets/SHA256SUMS.txt
-            release-assets/mapping.txt.gz
-
-      - name: Remove signing keystore
-        if: always()
-        run: |
-          if [ -n "${ANDROID_SIGNING_KEYSTORE_FILE:-}" ] && [ -f "$ANDROID_SIGNING_KEYSTORE_FILE" ]; then
-            shred -u "$ANDROID_SIGNING_KEYSTORE_FILE" || rm -f "$ANDROID_SIGNING_KEYSTORE_FILE"
-          fi
+            ${{ steps.collect_assets.outputs.files }}
