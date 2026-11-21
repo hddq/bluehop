@@ -9,4 +9,4 @@ Instead of opening Bluetooth settings on the currently connected device to disco
 
 Requirements:
 - Android 17 (API level 37) or newer, using Android 17's public CompanionDeviceManager Bluetooth connect/disconnect APIs and local network permission.
-- Companion BlueHop hosts on the same Wi-Fi network (Android supported now, Linux pairing CLI available).
+- Companion BlueHop hosts on the same Wi-Fi network (Android and Linux clients supported).
