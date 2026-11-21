@@ -67,7 +67,7 @@ jobs:
                   next
                 }
               }
-              in_section && /^\[[^]]+\]:[[:space:]]+/ { exit }
+              in_section && /^\[[^]]+\]:[[:space:]]+/ { next }
               in_section && $0 !~ /^[[:space:]]*$/ { found = 1; exit }
               END { if (found) print "yes" }
             ' "$CHANGELOG_FILE")
@@ -236,7 +236,7 @@ jobs:
                   next
                 }
               }
-              in_section && /^\[[^]]+\]:[[:space:]]+/ { exit }
+              in_section && /^\[[^]]+\]:[[:space:]]+/ { next }
               in_section {
                 if (!started && $0 ~ /^[[:space:]]*$/) next
                 started = 1
