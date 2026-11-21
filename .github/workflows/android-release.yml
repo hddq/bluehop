@@ -58,6 +58,8 @@ jobs:
                 sub(/^##[[:space:]]+/, "", heading)
                 sub(/[[:space:]].*$/, "", heading)
                 sub(/\]\(.*\)$/, "]", heading)
+                sub(/^\\\[/, "[", heading)
+                sub(/\\\]$/, "]", heading)
                 gsub(/^\[|\]$/, "", heading)
                 sub(/^v/, "", heading)
                 if (heading == ver) {
@@ -225,6 +227,8 @@ jobs:
                 sub(/^##[[:space:]]+/, "", heading)
                 sub(/[[:space:]].*$/, "", heading)
                 sub(/\]\(.*\)$/, "]", heading)
+                sub(/^\\\[/, "[", heading)
+                sub(/\\\]$/, "]", heading)
                 gsub(/^\[|\]$/, "", heading)
                 sub(/^v/, "", heading)
                 if (heading == ver) {
