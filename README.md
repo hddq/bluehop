@@ -89,10 +89,12 @@ To run the `bluehop serve` daemon on NixOS, add the flake input and enable `serv
 }
 ```
 
-By default, `services.bluehop` runs as a dedicated `bluehop` system user and stores peers in `/var/lib/bluehop/peers.json`. Pair or grab using that store:
+By default, `services.bluehop` runs as a dedicated `bluehop` system user and stores peers in `/var/lib/bluehop/peers.json`. Pair outbound with another listening host (which works through the NixOS firewall without extra ports) or grab using that store:
 
 ```sh
-sudo -u bluehop bluehop pair --store /var/lib/bluehop/peers.json --listen
+sudo -u bluehop bluehop pair --store /var/lib/bluehop/peers.json
 ```
+
+If you need this host to accept an incoming pairing request instead, pass a fixed port different from the running holder port (for example `--listen --addr :8766`) and temporarily allow that TCP port in `networking.firewall.allowedTCPPorts`.
 
 Alternatively, set `services.bluehop.user` to your desktop username so the daemon and interactive `bluehop pair` / `bluehop grab` commands share `~/.config/bluehop/peers.json` without `--store`.

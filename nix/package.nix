@@ -27,6 +27,13 @@ buildGo127Module {
     sed -i -E 's/^go 1\.27\.[0-9]+$/go ${go_1_27.version}/' linux/go.mod
   '';
 
+  checkPhase = ''
+    runHook preCheck
+    export GOFLAGS=''${GOFLAGS//-trimpath/}
+    buildGoDir test ./...
+    runHook postCheck
+  '';
+
   env.CGO_ENABLED = 0;
 
   ldflags = [

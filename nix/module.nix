@@ -3,6 +3,7 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 
@@ -143,7 +144,7 @@ in
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
-        ExecStart = "${lib.getExe cfg.package} ${lib.escapeShellArgs args}";
+        ExecStart = "${lib.getExe cfg.package} ${utils.escapeSystemdExecArgs args}";
         User = cfg.user;
         Group = cfg.group;
         Restart = "on-failure";
@@ -151,6 +152,9 @@ in
 
         StateDirectory = lib.mkIf isSystemUser "bluehop";
         StateDirectoryMode = lib.mkIf isSystemUser "0700";
+        ReadWritePaths = lib.mkIf (cfg.storePath != null) [
+          (builtins.dirOf (toString cfg.storePath))
+        ];
 
         NoNewPrivileges = true;
         ProtectSystem = if isSystemUser then "strict" else "full";
