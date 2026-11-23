@@ -179,7 +179,7 @@ func (s *Server) Start(addr string) (int, error) {
 		return s.port, nil
 	}
 
-	ln, err := listenWithFallback(addr, s.cfg.OnLog)
+	ln, err := ListenWithFallback(addr, s.cfg.OnLog)
 	if err != nil {
 		return 0, err
 	}
@@ -245,7 +245,7 @@ func (s *Server) awaitInFlight(ctx context.Context) {
 	}
 }
 
-func listenWithFallback(addr string, onLog func(string)) (net.Listener, error) {
+func ListenWithFallback(addr string, onLog func(string)) (net.Listener, error) {
 	if strings.TrimSpace(addr) == "" {
 		addr = DefaultAddr
 	}

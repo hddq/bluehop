@@ -916,4 +916,51 @@ class PairingFlowTest {
             pairingServer.stop()
         }
     }
+
+    @Test
+    fun pairingSessionServerDefaultsTo8766AndFallsBackWhenBusy() = runBlocking {
+        assertEquals(8766, PairingSessionServer.DEFAULT_PORT)
+
+        val occupied = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val occupiedPort = occupied.localPort
+        val logs = mutableListOf<String>()
+        val fallbackServer = PairingSessionServer(
+            host = "127.0.0.1",
+            preferredPort = occupiedPort,
+            identityProvider = { responderIdentity },
+            onPeerPaired = {},
+            onLog = { logs += it },
+        )
+        try {
+            val boundPort = fallbackServer.start()
+            assertTrue("Expected ephemeral fallback port > 0", boundPort > 0)
+            assertTrue("Expected fallback port != occupied port $occupiedPort", boundPort != occupiedPort)
+            assertTrue(
+                "Expected fallback log entry, got $logs",
+                logs.any { it.contains("Port $occupiedPort unavailable, falling back to ephemeral port") },
+            )
+        } finally {
+            fallbackServer.stop()
+            occupied.close()
+        }
+
+        val defaultPortFree = runCatching {
+            ServerSocket(PairingSessionServer.DEFAULT_PORT, 1, InetAddress.getByName("127.0.0.1")).close()
+        }.isSuccess
+        val defaultServer = PairingSessionServer(
+            host = "127.0.0.1",
+            identityProvider = { responderIdentity },
+            onPeerPaired = {},
+        )
+        try {
+            val defaultPort = defaultServer.start()
+            if (defaultPortFree) {
+                assertEquals(PairingSessionServer.DEFAULT_PORT, defaultPort)
+            } else {
+                assertTrue("Expected valid fallback port, got $defaultPort", defaultPort > 0)
+            }
+        } finally {
+            defaultServer.stop()
+        }
+    }
 }
