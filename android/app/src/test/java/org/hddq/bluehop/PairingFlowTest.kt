@@ -944,20 +944,28 @@ class PairingFlowTest {
             occupied.close()
         }
 
-        val defaultPortFree = runCatching {
-            ServerSocket(PairingSessionServer.DEFAULT_PORT, 1, InetAddress.getByName("127.0.0.1")).close()
-        }.isSuccess
+        val defaultLogs = mutableListOf<String>()
         val defaultServer = PairingSessionServer(
             host = "127.0.0.1",
             identityProvider = { responderIdentity },
             onPeerPaired = {},
+            onLog = { defaultLogs += it },
         )
         try {
             val defaultPort = defaultServer.start()
-            if (defaultPortFree) {
-                assertEquals(PairingSessionServer.DEFAULT_PORT, defaultPort)
+            val expectedFallbackLog =
+                "Port ${PairingSessionServer.DEFAULT_PORT} unavailable, falling back to ephemeral port"
+            if (defaultPort == PairingSessionServer.DEFAULT_PORT) {
+                assertFalse(
+                    "Did not expect fallback log when bound to default port, got $defaultLogs",
+                    defaultLogs.any { it.contains(expectedFallbackLog) },
+                )
             } else {
                 assertTrue("Expected valid fallback port, got $defaultPort", defaultPort > 0)
+                assertTrue(
+                    "Expected fallback log entry for port ${PairingSessionServer.DEFAULT_PORT}, got $defaultLogs",
+                    defaultLogs.any { it.contains(expectedFallbackLog) },
+                )
             }
         } finally {
             defaultServer.stop()
