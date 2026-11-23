@@ -19,6 +19,9 @@ import (
 )
 
 const (
+	DefaultPort = 8766
+	DefaultAddr = ":8766"
+
 	defaultMaxBodyBytes   = 64 * 1024
 	defaultPollInterval   = 500 * time.Millisecond
 	defaultRequestTimeout = 5 * time.Second

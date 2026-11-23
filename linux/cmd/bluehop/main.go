@@ -228,7 +228,7 @@ func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliD
 	fs := pflag.NewFlagSet("pair", pflag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listenMode := fs.BoolP("listen", "l", false, "Wait for an incoming pairing request and display the 6-digit verification code")
-	listenAddr := fs.StringP("addr", "a", ":0", "Listen address when --listen is set")
+	listenAddr := fs.StringP("addr", "a", pairing.DefaultAddr, "Listen address when --listen is set")
 	nameFlag := fs.StringP("name", "n", "", "Local device name advertised during pairing")
 	storeFlag := fs.StringP("store", "s", "", "Path to peers.json (default XDG config)")
 	timeoutFlag := fs.DurationP("timeout", "t", (protocol.PairingSessionTTLSec+15)*time.Second, "Pairing timeout")
@@ -368,7 +368,12 @@ func runPairServer(
 	stdout, stderr io.Writer,
 	deps cliDeps,
 ) int {
-	ln, err := net.Listen("tcp", listenAddr)
+	if strings.TrimSpace(listenAddr) == "" {
+		listenAddr = pairing.DefaultAddr
+	}
+	ln, err := holder.ListenWithFallback(listenAddr, func(msg string) {
+		fmt.Fprintln(stderr, msg)
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "listen %s: %v\n", listenAddr, err)
 		return 1

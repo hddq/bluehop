@@ -86,7 +86,7 @@ private data class ActivePairingSession(
 
 class PairingSessionServer(
     private val host: String = HolderHttpServer.DEFAULT_HOST,
-    private val preferredPort: Int = 0,
+    private val preferredPort: Int = DEFAULT_PORT,
     private val identityProvider: suspend () -> LocalDeviceIdentity,
     private val onPeerPaired: suspend (PairedPeer) -> Unit,
     private val nowEpochSeconds: () -> Long = { System.currentTimeMillis() / 1_000L },
@@ -112,13 +112,13 @@ class PairingSessionServer(
         }
 
         val (started, boundHost) = try {
-            startEngine(host) to host
+            startEngineWithPortFallback(host) to host
         } catch (error: Throwable) {
             if (host == HolderHttpServer.DEFAULT_HOST && isIpv6UnavailableError(error)) {
                 onLog(
                     "Dual-stack IPv6 unavailable on $host, falling back to ${HolderHttpServer.IPV4_FALLBACK_HOST}",
                 )
-                startEngine(HolderHttpServer.IPV4_FALLBACK_HOST) to HolderHttpServer.IPV4_FALLBACK_HOST
+                startEngineWithPortFallback(HolderHttpServer.IPV4_FALLBACK_HOST) to HolderHttpServer.IPV4_FALLBACK_HOST
             } else {
                 throw error
             }
@@ -131,12 +131,31 @@ class PairingSessionServer(
         return boundPort
     }
 
+    private fun startEngineWithPortFallback(
+        bindHost: String,
+    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
+        if (preferredPort != 0 && !canBindPort(bindHost, preferredPort)) {
+            onLog("Port $preferredPort unavailable, falling back to ephemeral port")
+            return startEngine(bindHost, 0)
+        }
+        return try {
+            startEngine(bindHost, preferredPort)
+        } catch (error: Throwable) {
+            if (preferredPort == 0 || !isAddressInUseError(error)) {
+                throw error
+            }
+            onLog("Port $preferredPort unavailable, falling back to ephemeral port")
+            startEngine(bindHost, 0)
+        }
+    }
+
     private fun startEngine(
         bindHost: String,
+        port: Int,
     ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
         val candidate = embeddedServer(
             factory = CIO,
-            port = preferredPort,
+            port = port,
             host = bindHost,
         ) {
             routing {
@@ -515,6 +534,7 @@ class PairingSessionServer(
     }
 
     companion object {
+        const val DEFAULT_PORT = 8766
         const val DEFAULT_SESSION_TTL_SECONDS = 60L
     }
 }

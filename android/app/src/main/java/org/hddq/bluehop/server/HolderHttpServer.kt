@@ -118,14 +118,19 @@ class HolderHttpServer(
 
     private fun startEngineWithPortFallback(
         bindHost: String,
-    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> =
-        try {
+    ): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration> {
+        if (preferredPort != 0 && !canBindPort(bindHost, preferredPort)) {
+            onLog("Port $preferredPort unavailable, falling back to ephemeral port")
+            return startEngine(bindHost, 0)
+        }
+        return try {
             startEngine(bindHost, preferredPort)
-        } catch (error: BindException) {
-            if (preferredPort == 0) throw error
+        } catch (error: Throwable) {
+            if (preferredPort == 0 || !isAddressInUseError(error)) throw error
             onLog("Port $preferredPort unavailable, falling back to ephemeral port")
             startEngine(bindHost, 0)
         }
+    }
 
     suspend fun awaitIdle(timeoutMs: Long = 3_000L) {
         withTimeoutOrNull(timeoutMs) {
@@ -448,3 +453,24 @@ internal fun isIpv6UnavailableError(error: Throwable): Boolean =
             (cause is BindException &&
                 cause.message?.contains("assign requested address", ignoreCase = true) == true)
     }
+
+internal fun isAddressInUseError(error: Throwable): Boolean =
+    !isIpv6UnavailableError(error) &&
+        generateSequence(error) { it.cause }.any { it is BindException }
+
+internal fun canBindPort(host: String, port: Int): Boolean {
+    if (port == 0) return true
+    return try {
+        java.net.ServerSocket().use { socket ->
+            socket.reuseAddress = true
+            socket.bind(java.net.InetSocketAddress(java.net.InetAddress.getByName(host), port), 1)
+        }
+        true
+    } catch (error: Throwable) {
+        if (isAddressInUseError(error)) {
+            false
+        } else {
+            throw error
+        }
+    }
+}

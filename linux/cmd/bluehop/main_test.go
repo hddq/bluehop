@@ -24,6 +24,7 @@ import (
 	"github.com/hddq/bluehop/linux/internal/grab"
 	"github.com/hddq/bluehop/linux/internal/holder"
 	"github.com/hddq/bluehop/linux/internal/mdns"
+	"github.com/hddq/bluehop/linux/internal/pairing"
 	"github.com/hddq/bluehop/linux/internal/peers"
 	"github.com/hddq/bluehop/linux/internal/protocol"
 )
@@ -1616,6 +1617,83 @@ func TestCLIServeLiveMDNSRefresh(t *testing.T) {
 		}
 		if !strings.Contains(stderr.String(), "BlueZ signal stream closed") {
 			t.Fatalf("expected stream closed warning in stderr, got %q", stderr.String())
+		}
+	})
+}
+
+func TestCLIPairListenDefaultPortAndFallback(t *testing.T) {
+	t.Run("defaults to pairing.DefaultPort when available", func(t *testing.T) {
+		probe, err := net.Listen("tcp", pairing.DefaultAddr)
+		if err != nil {
+			t.Skipf("default pairing port %s already in use: %v", pairing.DefaultAddr, err)
+		}
+		_ = probe.Close()
+
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		var gotCfg mdns.AdvertiseConfig
+		advStarted := make(chan struct{})
+
+		var stdout, stderr bytes.Buffer
+		codeCh := make(chan int, 1)
+		go func() {
+			codeCh <- runWithDeps(
+				[]string{"pair", "--listen", "--name", "Default Port Pairer", "--store", storePath, "--timeout", "200ms"},
+				strings.NewReader(""),
+				&stdout,
+				&stderr,
+				cliDeps{
+					startAdvertising: func(cfg mdns.AdvertiseConfig) (mdns.Advertiser, error) {
+						gotCfg = cfg
+						close(advStarted)
+						return &mockAdvertiser{}, nil
+					},
+				},
+			)
+		}()
+
+		select {
+		case <-advStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for pairing mDNS advertisement; stderr=%q", stderr.String())
+		}
+
+		_ = <-codeCh
+		if gotCfg.Port != pairing.DefaultPort {
+			t.Fatalf("advertised pairing port = %d, want %d (stdout=%q stderr=%q)", gotCfg.Port, pairing.DefaultPort, stdout.String(), stderr.String())
+		}
+		if !strings.Contains(stdout.String(), fmt.Sprintf("on port %d", pairing.DefaultPort)) {
+			t.Fatalf("expected stdout to report port %d, got %q", pairing.DefaultPort, stdout.String())
+		}
+	})
+
+	t.Run("falls back to ephemeral port when requested port is busy", func(t *testing.T) {
+		occupied, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("occupy test port: %v", err)
+		}
+		defer occupied.Close()
+		occupiedAddr := occupied.Addr().String()
+		_, occupiedPort, _ := net.SplitHostPort(occupiedAddr)
+
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "peers.json")
+		var stdout, stderr bytes.Buffer
+		code := runWithDeps(
+			[]string{"pair", "--listen", "--addr", occupiedAddr, "--store", storePath, "--timeout", "150ms"},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+			cliDeps{},
+		)
+		if code == 0 {
+			t.Fatalf("expected timeout exit code 1, got 0")
+		}
+		if !strings.Contains(stderr.String(), fmt.Sprintf("Port %s unavailable, falling back to ephemeral port", occupiedPort)) {
+			t.Fatalf("expected port fallback warning in stderr, got %q", stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Waiting for pairing request") {
+			t.Fatalf("expected pairing listener to start after fallback, got stdout=%q stderr=%q", stdout.String(), stderr.String())
 		}
 	})
 }
