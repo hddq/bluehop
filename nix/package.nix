@@ -2,12 +2,23 @@
   lib,
   buildGo127Module,
   go_1_27,
-  version ? "0.2.0",
+  version ? null,
 }:
-
+let
+  gradleVersionMatch = builtins.match ".*\n[[:space:]]*versionName = \"([^\"]+)\".*" (
+    builtins.readFile ../android/app/build.gradle.kts
+  );
+  resolvedVersion =
+    if version != null then
+      version
+    else if gradleVersionMatch != null then
+      builtins.head gradleVersionMatch
+    else
+      throw "Could not parse versionName from android/app/build.gradle.kts";
+in
 buildGo127Module {
   pname = "bluehop";
-  inherit version;
+  version = resolvedVersion;
 
   src = lib.fileset.toSource {
     root = ./..;
@@ -39,7 +50,7 @@ buildGo127Module {
   ldflags = [
     "-s"
     "-w"
-    "-X main.version=v${version}"
+    "-X main.version=v${resolvedVersion}"
   ];
 
   meta = {

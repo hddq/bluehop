@@ -50,11 +50,13 @@ Common commands:
 
 The repository flake exports `packages.<system>.bluehop` (as `default` for `x86_64-linux` and `aarch64-linux`), `overlays.default`, and `nixosModules.default` (`nixosModules.bluehop`).
 
+Use `github:hddq/bluehop/stable` for the latest stable release (automatically updated on each release tag), `github:hddq/bluehop/vX.Y.Z` to pin a specific tag, or `github:hddq/bluehop` for `master`.
+
 Run or install the CLI with flakes:
 
 ```sh
-nix run github:hddq/bluehop -- devices
-nix profile install github:hddq/bluehop
+nix run github:hddq/bluehop/stable -- devices
+nix profile install github:hddq/bluehop/stable
 ```
 
 To run the `bluehop serve` daemon on NixOS, add the flake input and enable `services.bluehop`:
@@ -64,7 +66,7 @@ To run the `bluehop serve` daemon on NixOS, add the flake input and enable `serv
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    bluehop.url = "github:hddq/bluehop";
+    bluehop.url = "github:hddq/bluehop/stable";
   };
 
   outputs = { nixpkgs, bluehop, ... }: {
