@@ -92,7 +92,7 @@ in
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Whether to open the holder TCP port and mDNS UDP port (5353) in the firewall.";
+      description = "Whether to open the holder TCP port, pairing TCP port (8766), and mDNS UDP port (5353) in the firewall.";
     };
 
     extraArgs = lib.mkOption {
@@ -125,7 +125,10 @@ in
     };
 
     networking.firewall = lib.mkIf cfg.openFirewall {
-      allowedTCPPorts = [ parsedPort ];
+      allowedTCPPorts = lib.unique [
+        parsedPort
+        8766
+      ];
       allowedUDPPorts = [ 5353 ];
     };
 
