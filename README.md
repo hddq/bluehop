@@ -45,3 +45,54 @@ Common commands:
 - `bluehop grab <mac-or-name>` — release a Bluetooth device from the current holder and connect locally
 - `bluehop peers [list|scan|remove]` — manage paired BlueHop hosts
 - `bluehop version` — print the CLI version
+
+#### Nix / NixOS
+
+The repository flake exports `packages.<system>.bluehop` (as `default` for `x86_64-linux` and `aarch64-linux`), `overlays.default`, and `nixosModules.default` (`nixosModules.bluehop`).
+
+Run or install the CLI with flakes:
+
+```sh
+nix run github:hddq/bluehop -- devices
+nix profile install github:hddq/bluehop
+```
+
+To run the `bluehop serve` daemon on NixOS, add the flake input and enable `services.bluehop`:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    bluehop.url = "github:hddq/bluehop";
+  };
+
+  outputs = { nixpkgs, bluehop, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        bluehop.nixosModules.default
+        {
+          hardware.bluetooth.enable = true;
+
+          services.bluehop = {
+            enable = true;
+            openFirewall = true; # opens holder TCP port (8765) and mDNS UDP port (5353)
+            # listenAddress = ":8765";
+            # deviceName = "my-host";
+            # user = "alice"; # optional: share ~/.config/bluehop/peers.json with your user
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+By default, `services.bluehop` runs as a dedicated `bluehop` system user and stores peers in `/var/lib/bluehop/peers.json`. Pair or grab using that store:
+
+```sh
+sudo -u bluehop bluehop pair --store /var/lib/bluehop/peers.json --listen
+```
+
+Alternatively, set `services.bluehop.user` to your desktop username so the daemon and interactive `bluehop pair` / `bluehop grab` commands share `~/.config/bluehop/peers.json` without `--store`.

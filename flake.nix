@@ -1,5 +1,5 @@
 {
-  description = "BlueHop development shell";
+  description = "BlueHop - multipoint-like switching for single-connection Bluetooth devices";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,16 +7,19 @@
 
   outputs = { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs {
-        inherit system;
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+
+      devSystem = "x86_64-linux";
+      devPkgs = import nixpkgs {
+        system = devSystem;
         config = {
           allowUnfree = true;
           android_sdk.accept_license = true;
         };
       };
 
-      androidComposition = pkgs.androidenv.composeAndroidPackages {
+      androidComposition = devPkgs.androidenv.composeAndroidPackages {
         platformVersions = [ "37.1" ];
         buildToolsVersions = [ "37.0.0" ];
         abiVersions = [ "arm64-v8a" "x86_64" ];
@@ -27,8 +30,31 @@
       };
       androidSdk = androidComposition.androidsdk;
     in {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [
+      packages = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          bluehop = pkgs.callPackage ./nix/package.nix { };
+        in {
+          inherit bluehop;
+          default = bluehop;
+        }
+      );
+
+      overlays.default = final: prev: {
+        bluehop = final.callPackage ./nix/package.nix { };
+      };
+
+      nixosModules = rec {
+        bluehop = import ./nix/module.nix { inherit self; };
+        default = bluehop;
+      };
+
+      checks = forAllSystems (system: {
+        bluehop = self.packages.${system}.bluehop;
+      });
+
+      devShells.${devSystem}.default = devPkgs.mkShell {
+        packages = with devPkgs; [
           jdk21
           gradle
           android-tools
@@ -37,7 +63,7 @@
           git
         ];
 
-        JAVA_HOME = pkgs.jdk21;
+        JAVA_HOME = devPkgs.jdk21;
         ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
         ANDROID_SDK_ROOT = "${androidSdk}/libexec/android-sdk";
         GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdk}/libexec/android-sdk/build-tools/37.0.0/aapt2";
