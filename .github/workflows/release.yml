@@ -380,3 +380,33 @@ jobs:
           body_path: ${{ steps.changelog.outputs.path }}
           files: |
             ${{ steps.collect_assets.outputs.files }}
+
+  update-stable:
+    needs: publish-release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward stable branch
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          COMMIT_SHA=$(git rev-parse 'HEAD^{commit}')
+          rc=0
+          git ls-remote --exit-code --heads origin stable >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch --no-tags origin refs/heads/stable:refs/remotes/origin/stable
+            if ! git merge-base --is-ancestor origin/stable "$COMMIT_SHA"; then
+              echo "::error::Cannot fast-forward origin/stable to $TAG ($COMMIT_SHA) because origin/stable is not an ancestor."
+              exit 1
+            fi
+          elif [ "$rc" -ne 2 ]; then
+            exit "$rc"
+          fi
+          git push origin "${COMMIT_SHA}:refs/heads/stable"
