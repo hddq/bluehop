@@ -82,7 +82,7 @@ To run the `bluehop serve` daemon on NixOS, add the flake input and enable `serv
             openFirewall = true; # opens holder (8765) and pairing (8766) TCP ports + mDNS UDP port (5353)
             # listenAddress = ":8765";
             # deviceName = "my-host";
-            # user = "alice"; # optional: share ~/.config/bluehop/peers.json with your user
+            # storePath = "/path/to/peers.json";
           };
         }
       ];
@@ -91,10 +91,4 @@ To run the `bluehop serve` daemon on NixOS, add the flake input and enable `serv
 }
 ```
 
-By default, `services.bluehop` runs as a dedicated `bluehop` system user and stores peers in `/var/lib/bluehop/peers.json`. Pair or grab using that store (pairing listens on TCP port `8766` by default):
-
-```sh
-sudo -u bluehop bluehop pair --store /var/lib/bluehop/peers.json --listen
-```
-
-Alternatively, set `services.bluehop.user` to your desktop username so the daemon and interactive `bluehop pair` / `bluehop grab` commands share `~/.config/bluehop/peers.json` without `--store`.
+`services.bluehop` runs as a systemd user service (`systemctl --user status bluehop`), so it automatically shares `~/.config/bluehop/peers.json` with interactive `bluehop pair`, `bluehop peers`, and `bluehop grab` commands.
