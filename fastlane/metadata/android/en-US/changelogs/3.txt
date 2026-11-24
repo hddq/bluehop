@@ -1,0 +1,2 @@
+* Use static default pairing port 8766
+* Allow companion background network access

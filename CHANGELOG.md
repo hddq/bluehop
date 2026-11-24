@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Protocol
+
+- Use static default pairing port 8766.
+
+### Nix
+
+- Package BlueHop and add a NixOS service module.
+
+### Android
+
+- Allow companion background network access.
+
+### CI
+
+- Update stable branch for tagged Nix releases.
+
 ## [0.2.0] - 2026-11-21
 
 ### Linux
@@ -23,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial Android release.
 
-[Unreleased]: https://github.com/hddq/bluehop/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hddq/bluehop/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hddq/bluehop/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hddq/bluehop/releases/tag/v0.2.0
 [0.1.0]: https://github.com/hddq/bluehop/releases/tag/v0.1.0
