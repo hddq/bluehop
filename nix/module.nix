@@ -9,18 +9,9 @@
 
 let
   cfg = config.services.bluehop;
-  isSystemUser = cfg.user == "bluehop";
 
   portMatch = builtins.match ".*:([0-9]+)" cfg.listenAddress;
   parsedPort = if portMatch != null then lib.toInt (builtins.head portMatch) else null;
-
-  resolvedStorePath =
-    if cfg.storePath != null then
-      cfg.storePath
-    else if isSystemUser then
-      "/var/lib/bluehop/peers.json"
-    else
-      null;
 
   args =
     [
@@ -32,13 +23,26 @@ let
       "--name"
       cfg.deviceName
     ]
-    ++ lib.optionals (resolvedStorePath != null) [
+    ++ lib.optionals (cfg.storePath != null) [
       "--store"
-      (toString resolvedStorePath)
+      (toString cfg.storePath)
     ]
     ++ cfg.extraArgs;
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "services" "bluehop" "user" ] ''
+      services.bluehop now runs as a systemd user service (`systemd.user.services.bluehop`)
+      so it automatically shares each user's `~/.config/bluehop/peers.json` store.
+      Remove `services.bluehop.user` from your configuration.
+    '')
+    (lib.mkRemovedOptionModule [ "services" "bluehop" "group" ] ''
+      services.bluehop now runs as a systemd user service (`systemd.user.services.bluehop`)
+      so it automatically shares each user's `~/.config/bluehop/peers.json` store.
+      Remove `services.bluehop.group` from your configuration.
+    '')
+  ];
+
   options.services.bluehop = {
     enable = lib.mkEnableOption "BlueHop holder daemon";
 
@@ -71,22 +75,9 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = ''
-        Path to `peers.json` (`--store`). Defaults to `/var/lib/bluehop/peers.json` when
-        `services.bluehop.user` is `"bluehop"`, or the user's XDG config directory otherwise.
+        Path to `peers.json` (`--store`). Defaults to the user's XDG config directory
+        (`$XDG_CONFIG_HOME/bluehop/peers.json` or `~/.config/bluehop/peers.json`).
       '';
-    };
-
-    user = lib.mkOption {
-      type = lib.types.str;
-      default = "bluehop";
-      description = "User account under which the BlueHop holder service runs.";
-    };
-
-    group = lib.mkOption {
-      type = lib.types.str;
-      default = if isSystemUser then "bluehop" else config.users.users.${cfg.user}.group;
-      defaultText = lib.literalExpression ''"bluehop" (or the user's primary group)'';
-      description = "Group under which the BlueHop holder service runs.";
     };
 
     openFirewall = lib.mkOption {
@@ -112,18 +103,6 @@ in
 
     environment.systemPackages = [ cfg.package ];
 
-    users.users = lib.mkIf isSystemUser {
-      bluehop = {
-        isSystemUser = true;
-        group = cfg.group;
-        description = "BlueHop holder daemon user";
-      };
-    };
-
-    users.groups = lib.mkIf (cfg.group == "bluehop") {
-      bluehop = { };
-    };
-
     networking.firewall = lib.mkIf cfg.openFirewall {
       allowedTCPPorts = lib.unique [
         parsedPort
@@ -132,46 +111,24 @@ in
       allowedUDPPorts = [ 5353 ];
     };
 
-    systemd.services.bluehop = {
+    systemd.user.services.bluehop = {
       description = "BlueHop Bluetooth holder daemon";
-      after = [
-        "network-online.target"
-        "bluetooth.target"
-        "dbus.service"
-      ];
-      wants = [
-        "network-online.target"
-        "bluetooth.target"
-      ];
-      requires = [ "dbus.service" ];
-      wantedBy = [ "multi-user.target" ];
+      wantedBy = [ "default.target" ];
+
+      unitConfig = {
+        ConditionUser = "!@system";
+      };
 
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} ${utils.escapeSystemdExecArgs args}";
-        User = cfg.user;
-        Group = cfg.group;
         Restart = "on-failure";
         RestartSec = 5;
 
-        StateDirectory = lib.mkIf isSystemUser "bluehop";
-        StateDirectoryMode = lib.mkIf isSystemUser "0700";
-        ReadWritePaths = lib.mkIf (cfg.storePath != null) [
-          (builtins.dirOf (toString cfg.storePath))
-        ];
-
         NoNewPrivileges = true;
-        ProtectSystem = if isSystemUser then "strict" else "full";
-        ProtectHome = isSystemUser;
-        PrivateTmp = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectControlGroups = true;
-        RestrictSUIDSGID = true;
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         RestrictRealtime = true;
-        CapabilityBoundingSet = "";
-        AmbientCapabilities = "";
+        RestrictSUIDSGID = true;
       };
     };
   };
