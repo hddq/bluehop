@@ -433,3 +433,56 @@ func TestSingleSessionAndPaddedIDAndNoRedirects(t *testing.T) {
 		t.Fatalf("expected redirect target not to be contacted, got %d hits", targetHits.Load())
 	}
 }
+
+func TestNormalizeBaseURL(t *testing.T) {
+	valid := []struct {
+		input string
+		want  string
+	}{
+		{"192.168.1.42", "http://192.168.1.42:8766"},
+		{" 192.168.1.42 ", "http://192.168.1.42:8766"},
+		{"http://laptop.local/", "http://laptop.local:8766"},
+		{"[2001:db8::1]", "http://[2001:db8::1]:8766"},
+		{"http://[::1]/", "http://[::1]:8766"},
+		{"192.168.1.42:43215", "http://192.168.1.42:43215"},
+		{"http://laptop.local:9000/", "http://laptop.local:9000"},
+		{"[::1]:8765", "http://[::1]:8765"},
+		{"[2001:db8::1]:43215", "http://[2001:db8::1]:43215"},
+	}
+	for _, tc := range valid {
+		got, err := NormalizeBaseURL(tc.input)
+		if err != nil {
+			t.Errorf("NormalizeBaseURL(%q) unexpected error: %v", tc.input, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("NormalizeBaseURL(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"   ",
+		"http://",
+		"2001:db8::1",
+		"https://192.168.1.42:8765",
+		"https://192.168.1.42",
+		"192.168.1.42:",
+		"[::1]:",
+		":8765",
+		"192.168.1.42:0",
+		"192.168.1.42:65536",
+		"192.168.1.42:abc",
+		"192.168.1.42/pair",
+		"192.168.1.42?a=b",
+		"user@192.168.1.42:8765",
+		"192.168.1.42 8765",
+		"[::1",
+		"[::1]extra",
+	}
+	for _, input := range invalid {
+		if got, err := NormalizeBaseURL(input); err == nil {
+			t.Errorf("NormalizeBaseURL(%q) = %q, want error", input, got)
+		}
+	}
+}

@@ -300,19 +300,20 @@ data class ManualPairingTarget(
 internal fun parseManualPairingAddress(
     input: String,
 ): Result<ManualPairingTarget> = runCatching {
+    val defaultPort = PairingSessionServer.DEFAULT_PORT
     val trimmed = input.trim()
-    require(trimmed.isNotEmpty()) { "Enter host:port (for example 192.168.1.10:43215)" }
+    require(trimmed.isNotEmpty()) { "Enter host or host:port (for example 192.168.1.10:$defaultPort)" }
 
     val withoutScheme = when {
         trimmed.startsWith("http://", ignoreCase = true) -> trimmed.substring(7)
-        "://" in trimmed -> error("Only http:// or host:port addresses are supported")
+        "://" in trimmed -> error("Only http:// or host[:port] addresses are supported")
         else -> trimmed
     }.trimEnd('/')
 
-    require(withoutScheme.isNotEmpty()) { "Enter host:port (for example 192.168.1.10:43215)" }
+    require(withoutScheme.isNotEmpty()) { "Enter host or host:port (for example 192.168.1.10:$defaultPort)" }
     require(withoutScheme.none { it.isWhitespace() }) { "Host address must not contain spaces" }
     require('/' !in withoutScheme && '?' !in withoutScheme && '#' !in withoutScheme && '@' !in withoutScheme) {
-        "Enter only host:port"
+        "Enter only host or host:port"
     }
 
     val (rawHost, port) = if (withoutScheme.startsWith("[")) {
@@ -320,15 +321,16 @@ internal fun parseManualPairingAddress(
         require(closeBracket > 1) { "Invalid IPv6 address" }
         val hostPart = withoutScheme.substring(1, closeBracket)
         val remainder = withoutScheme.substring(closeBracket + 1)
-        require(remainder.startsWith(":")) {
-            "Include :port (for example [::1]:43215)"
+        when {
+            remainder.isEmpty() -> hostPart to defaultPort
+            remainder.startsWith(":") -> hostPart to parseManualPairingPort(remainder.substring(1))
+            else -> error("Use [host] or [host]:port (for example [::1]:$defaultPort)")
         }
-        hostPart to parseManualPairingPort(remainder.substring(1))
     } else {
         require('[' !in withoutScheme && ']' !in withoutScheme) { "Invalid brackets in host address" }
         val colonCount = withoutScheme.count { it == ':' }
         when (colonCount) {
-            0 -> error("Include :port (for example 192.168.1.10:43215)")
+            0 -> withoutScheme to defaultPort
             1 -> {
                 val colonIndex = withoutScheme.indexOf(':')
                 val hostPart = withoutScheme.substring(0, colonIndex)
@@ -336,12 +338,12 @@ internal fun parseManualPairingAddress(
                 require(hostPart.isNotEmpty()) { "Enter a host before :port" }
                 hostPart to parseManualPairingPort(portPart)
             }
-            else -> error("Use [host]:port for IPv6 addresses")
+            else -> error("Use [host] or [host]:port for IPv6 addresses")
         }
     }
 
     val host = rawHost.trim()
-    require(host.isNotEmpty()) { "Enter host:port (for example 192.168.1.10:43215)" }
+    require(host.isNotEmpty()) { "Enter host or host:port (for example 192.168.1.10:$defaultPort)" }
     val url = URI.create(PairingClient.formatBaseUrl(host, port)).toURL()
     require(url.host.isNotBlank()) { "Invalid host address" }
 

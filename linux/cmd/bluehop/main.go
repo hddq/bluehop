@@ -234,8 +234,8 @@ func runPair(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliD
 	timeoutFlag := fs.DurationP("timeout", "t", (protocol.PairingSessionTTLSec+15)*time.Second, "Pairing timeout")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  bluehop pair [options] [<host:port>]  Discover or connect to a waiting host")
-		fmt.Fprintln(stderr, "  bluehop pair --listen [options]       Wait for a peer, verify 6-digit code, and Accept/Reject")
+		fmt.Fprintln(stderr, "  bluehop pair [options] [<host[:port]>]  Discover or connect to a waiting host")
+		fmt.Fprintln(stderr, "  bluehop pair --listen [options]         Wait for a peer, verify 6-digit code, and Accept/Reject")
 		fmt.Fprintln(stderr, "")
 		fmt.Fprintln(stderr, "Options:")
 		fs.PrintDefaults()
@@ -297,7 +297,7 @@ func discoverPairingTarget(
 	deps cliDeps,
 ) (string, bool) {
 	if deps.discoverPeers == nil {
-		fmt.Fprintln(stderr, "mDNS discovery unavailable; pass <host:port> explicitly")
+		fmt.Fprintln(stderr, "mDNS discovery unavailable; pass <host[:port]> explicitly")
 		return "", false
 	}
 	fmt.Fprintln(stdout, "Searching for waiting BlueHop hosts via mDNS...")
@@ -309,11 +309,11 @@ func discoverPairingTarget(
 		PairingOnly:     true,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "mDNS discovery failed: %v (pass <host:port> explicitly)\n", err)
+		fmt.Fprintf(stderr, "mDNS discovery failed: %v (pass <host[:port]> explicitly)\n", err)
 		return "", false
 	}
 	if len(found) == 0 {
-		fmt.Fprintln(stderr, "No BlueHop hosts advertising pairing on the LAN. Start pairing on the peer or pass <host:port>.")
+		fmt.Fprintln(stderr, "No BlueHop hosts advertising pairing on the LAN. Start pairing on the peer or pass <host[:port]>.")
 		return "", false
 	}
 	if len(found) == 1 {

@@ -508,6 +508,22 @@ class PairingFlowTest {
     @Test
     fun parseManualPairingAddressParsesValidHostsAndPorts() {
         assertEquals(
+            ManualPairingTarget("192.168.1.42", PairingSessionServer.DEFAULT_PORT),
+            parseManualPairingAddress("192.168.1.42").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("laptop.local", PairingSessionServer.DEFAULT_PORT),
+            parseManualPairingAddress("http://laptop.local/").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("2001:db8::1", PairingSessionServer.DEFAULT_PORT),
+            parseManualPairingAddress("[2001:db8::1]").getOrThrow(),
+        )
+        assertEquals(
+            ManualPairingTarget("::1", PairingSessionServer.DEFAULT_PORT),
+            parseManualPairingAddress("http://[::1]/").getOrThrow(),
+        )
+        assertEquals(
             ManualPairingTarget("192.168.1.42", 43215),
             parseManualPairingAddress("192.168.1.42:43215").getOrThrow(),
         )
@@ -534,12 +550,12 @@ class PairingFlowTest {
         val invalidInputs = listOf(
             "",
             "   ",
-            "192.168.1.42",
-            "http://laptop.local/",
-            "[2001:db8::1]",
+            "http://",
             "2001:db8::1",
             "https://192.168.1.42:8765",
+            "https://192.168.1.42",
             "192.168.1.42:",
+            "[::1]:",
             ":8765",
             "192.168.1.42:0",
             "192.168.1.42:65536",
