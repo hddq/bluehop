@@ -656,7 +656,10 @@ func NormalizeBaseURL(input string) (string, error) {
 		}
 		portStr = strconv.Itoa(port)
 	}
-	return "http://" + net.JoinHostPort(u.Hostname(), portStr), nil
+	return (&url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(u.Hostname(), portStr),
+	}).String(), nil
 }
 
 func decodeJSONBody(body io.Reader, dst any) error {

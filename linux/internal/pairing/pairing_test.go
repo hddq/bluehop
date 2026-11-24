@@ -444,6 +444,8 @@ func TestNormalizeBaseURL(t *testing.T) {
 		{"http://laptop.local/", "http://laptop.local:8766"},
 		{"[2001:db8::1]", "http://[2001:db8::1]:8766"},
 		{"http://[::1]/", "http://[::1]:8766"},
+		{"[fe80::1%25eth0]", "http://[fe80::1%25eth0]:8766"},
+		{"[fe80::1%25eth0]:43215", "http://[fe80::1%25eth0]:43215"},
 		{"192.168.1.42:43215", "http://192.168.1.42:43215"},
 		{"http://laptop.local:9000/", "http://laptop.local:9000"},
 		{"[::1]:8765", "http://[::1]:8765"},
@@ -457,6 +459,10 @@ func TestNormalizeBaseURL(t *testing.T) {
 		}
 		if got != tc.want {
 			t.Errorf("NormalizeBaseURL(%q) = %q, want %q", tc.input, got, tc.want)
+			continue
+		}
+		if _, err := http.NewRequest(http.MethodPost, got+"/pair/start", nil); err != nil {
+			t.Errorf("NormalizeBaseURL(%q) = %q produced invalid request URL: %v", tc.input, got, err)
 		}
 	}
 
