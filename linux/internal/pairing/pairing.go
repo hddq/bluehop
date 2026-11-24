@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -618,11 +620,12 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 	return nil
 }
 
-// NormalizeBaseURL turns "host:port", "[ipv6]:port", or "http://host:port/" into "http://host:port".
+// NormalizeBaseURL turns "host", "host:port", "[ipv6]", "[ipv6]:port", or "http://host[:port]/"
+// into "http://host:port", defaulting omitted ports to DefaultPort (8766).
 func NormalizeBaseURL(input string) (string, error) {
 	trimmed := strings.TrimSpace(input)
 	if trimmed == "" {
-		return "", errors.New("host address is required (e.g. 192.168.1.10:43215)")
+		return "", fmt.Errorf("host address is required (e.g. 192.168.1.10:%d)", DefaultPort)
 	}
 	if !strings.Contains(trimmed, "://") {
 		trimmed = "http://" + trimmed
@@ -632,15 +635,31 @@ func NormalizeBaseURL(input string) (string, error) {
 		return "", fmt.Errorf("invalid host address: %w", err)
 	}
 	if u.Scheme != "http" {
-		return "", errors.New("only http:// or host:port addresses are supported")
+		return "", errors.New("only http:// or host[:port] addresses are supported")
 	}
-	if u.Host == "" || u.Port() == "" || u.Hostname() == "" {
-		return "", errors.New("address must include host and port")
+	if u.Host == "" || u.Hostname() == "" {
+		return "", fmt.Errorf("host address is required (e.g. 192.168.1.10:%d)", DefaultPort)
 	}
 	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-		return "", errors.New("enter only host:port")
+		return "", errors.New("enter only host or host:port")
 	}
-	return "http://" + u.Host, nil
+	if strings.HasSuffix(u.Host, ":") {
+		return "", errors.New("port must be a number between 1 and 65535")
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		portStr = strconv.Itoa(DefaultPort)
+	} else {
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return "", errors.New("port must be a number between 1 and 65535")
+		}
+		portStr = strconv.Itoa(port)
+	}
+	return (&url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(u.Hostname(), portStr),
+	}).String(), nil
 }
 
 func decodeJSONBody(body io.Reader, dst any) error {

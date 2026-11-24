@@ -1,9 +1,9 @@
 # BlueHop Wire Protocol
 
-BlueHop uses two versioned HTTP/JSON protocols over local Wi-Fi (advertised via mDNS `_bluehop._tcp.`):
+BlueHop uses two versioned HTTP/JSON protocols over local Wi-Fi (advertised via mDNS `_bluehop._tcp.` on UDP port `5353`):
 
-- **Pairing Protocol v2 (`PAIRING_PROTOCOL_VERSION = 2`)**: ephemeral ECDH (P-256) + 6-digit Short Authentication String (SAS) + mutual HMAC key confirmation.
-- **Release Protocol v1 (`PROTOCOL_VERSION = 1`)**: authenticated `/status` and `/release` requests signed with the paired 32-byte per-peer PSK (`pskHex`).
+- **Pairing Protocol v2 (`PAIRING_PROTOCOL_VERSION = 2`)**: ephemeral ECDH (P-256) + 6-digit Short Authentication String (SAS) + mutual HMAC key confirmation. Listens on TCP port **`8766`** by default (falling back to an ephemeral port if unavailable; the bound port is advertised via mDNS).
+- **Release Protocol v1 (`PROTOCOL_VERSION = 1`)**: authenticated `/status` and `/release` requests signed with the paired 32-byte per-peer PSK (`pskHex`). Listens on TCP port **`8765`** by default (falling back to an ephemeral port if unavailable; the bound port is advertised via mDNS).
 
 Deterministic cross-platform test vectors for both protocols live in [`test-vectors.json`](test-vectors.json).
 

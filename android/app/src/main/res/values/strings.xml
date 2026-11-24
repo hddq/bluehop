@@ -51,7 +51,7 @@
     <string name="pairing_connect_searching">Searching Wi-Fi for waiting devices…</string>
     <string name="pairing_enter_manual_option">Enter address manually</string>
     <string name="pairing_enter_address_label">Host address</string>
-    <string name="pairing_enter_address_placeholder">192.168.1.10:43215</string>
+    <string name="pairing_enter_address_placeholder">192.168.1.10:8766</string>
     <string name="pairing_connect_sas_prompt">Confirm this 6-digit code matches %1$s and accept there.</string>
     <string name="pairing_action_connect_pair">Pair</string>
     <string name="pairing_status_pairing">Connecting…</string>
