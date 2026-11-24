@@ -91,4 +91,4 @@ To run the `bluehop serve` daemon on NixOS, add the flake input and enable `serv
 }
 ```
 
-`services.bluehop` runs as a systemd user service (`systemctl --user status bluehop`), so it automatically shares `~/.config/bluehop/peers.json` with interactive `bluehop pair`, `bluehop peers`, and `bluehop grab` commands.
+`services.bluehop` runs as a systemd user service (`systemctl --user status bluehop`), so by default it automatically shares `~/.config/bluehop/peers.json` with interactive `bluehop pair`, `bluehop peers`, and `bluehop grab` commands. If you set a custom `storePath`, pass the matching path to interactive commands via `--store` (for example, `bluehop pair --store /path/to/peers.json`).
