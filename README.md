@@ -26,6 +26,8 @@ If you'd like to add support for another platform (Windows, macOS, iOS, etc.), f
 
 BlueHop requires **Android 17 (SDK 37) or newer**. Android 17 is the first version of Android that lets regular apps connect and disconnect your paired Bluetooth devices on your behalf, which wasn't possible on older versions without root or system-level workarounds.
 
+You can install the Android app from the [F-Droid repository](https://fdroid.link/#https://fdroid.hddq.org/repo?fingerprint=A0B4263C095D99C34423F4171D458930CD4167C154A79D38DFC9F6EC0925A595) or download the APK from [GitHub Releases](https://github.com/hddq/bluehop/releases).
+
 ### Linux
 
 BlueHop provides a standalone `bluehop` CLI and host daemon in [`linux/`](linux/) for Linux systems running **BlueZ** (`org.bluez` on the system D-Bus) with local network mDNS access.
