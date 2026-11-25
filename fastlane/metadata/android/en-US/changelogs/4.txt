@@ -1,0 +1,1 @@
+* Default manual pairing port to 8766
