@@ -381,6 +381,16 @@ jobs:
           files: |
             ${{ steps.collect_assets.outputs.files }}
 
+      - name: Trigger central F-Droid repo update
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.FDROID_REPO_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/hddq/fdroid-repo/dispatches \
+            -f event_type=app-released \
+            -f "client_payload[repo]=${{ github.repository }}" \
+            -f "client_payload[tag]=${{ github.ref_name }}"
+
   update-stable:
     needs: publish-release
     if: ${{ !contains(github.ref_name, '-') }}
