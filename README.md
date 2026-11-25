@@ -1,5 +1,7 @@
 # BlueHop
 
+[![GitHub Downloads](https://img.shields.io/github/downloads/hddq/bluehop/total)](https://github.com/hddq/bluehop/releases)
+
 BlueHop brings multipoint-like switching to Bluetooth devices — such as headphones, speakers, and peripherals — that only support a single active connection at a time.
 
 ## Why BlueHop?
